@@ -1,0 +1,19 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+
+# Local OS metadata
+.DS_Store
+
+# Runtime state and generated alert output
+.earnings_calendar_cache.json
+.option_iv_history.json
+.trade_alert_dedupe.json
+.trade_alert_positions.json
+trade_alerts.jsonl
+
+# Generated backtest reports and logs
+logs/
