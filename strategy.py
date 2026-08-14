@@ -1,10 +1,12 @@
 # strategy.py
 import csv
+import hashlib
 import io
 import json
 import math
 import os
 import re
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +25,8 @@ from alpaca.trading.requests import (
     GetAssetsRequest,
     GetOptionContractsRequest,
     GetOrdersRequest,
+    LimitOrderRequest,
+    OptionLegRequest,
 )
 from alpaca.data.requests import (
     MostActivesRequest,
@@ -38,6 +42,10 @@ from alpaca.trading.enums import (
     ContractType,
     ExerciseStyle,
     QueryOrderStatus,
+    OrderClass,
+    OrderSide,
+    PositionIntent,
+    TimeInForce,
 )
 from alpaca.data.historical.option import (
     OptionHistoricalDataClient,
@@ -120,25 +128,28 @@ class StockSuggestionStrategy(Strategy):
         # before producing a micro-account alert.
         "micro_min_stock_score": 70.0,
 
-        # Allocate 5% of account equity to one fractional
-        # stock idea. With $100, this is $5 per idea.
-        "micro_position_pct_equity": 0.05,
+        # Allocate 10% of account equity to one fractional
+        # stock idea to increase capital utilization in micro
+        # accounts. With $100, this is $10 per idea.
+        "micro_position_pct_equity": 0.10,
 
-        # Hard dollar ceiling per micro position. The
-        # percentage rule remains the binding constraint for
-        # very small accounts.
-        "micro_max_position_dollars": 100.0,
+        # Hard dollar ceiling per micro position. $200 is 10%
+        # of the $2,000 micro-account threshold, so the 10%
+        # sizing rule can remain effective across the entire
+        # micro-account range while still retaining a hard cap.
+        "micro_max_position_dollars": 200.0,
 
-        # Cap all NEW micro alerts in one run at 25% of
-        # effective equity. With five 5% positions, this
-        # leaves at least 75% unallocated.
-        "micro_total_allocation_pct_equity": 0.25,
+        # Cap all NEW micro alerts in one run at 50% of
+        # effective equity. With five 10% positions, up to
+        # half the account can be deployed while retaining
+        # half as undeployed capacity.
+        "micro_total_allocation_pct_equity": 0.50,
 
         # Cumulative real-account stock exposure guard. New
         # micro alerts stop once broker stock gross market
-        # value reaches 50% of effective equity. Set <= 0 to
+        # value reaches 70% of effective equity. Set <= 0 to
         # disable this cap. Simulated test equity ignores it.
-        "micro_max_broker_stock_gross_pct_equity": 0.50,
+        "micro_max_broker_stock_gross_pct_equity": 0.70,
 
         # Avoid adding another micro alert for a stock already
         # held in the real Alpaca account. Simulated test equity
@@ -162,10 +173,12 @@ class StockSuggestionStrategy(Strategy):
         # Planning exits for the micro alert. These are
         # alert-only reference levels, not submitted orders.
         #
-        # 5% position size * 8% stop ~= 0.4% account risk
-        # per idea; five such ideas ~= 2% planned risk.
-        "micro_stop_loss_pct": 0.08,
-        "micro_profit_target_pct": 0.16,
+        # 10% position size * 6% stop ~= 0.6% account risk
+        # per idea; five such ideas ~= 3% planned risk. The
+        # 12% target preserves an approximate 2:1 target-to-
+        # stop relationship.
+        "micro_stop_loss_pct": 0.06,
+        "micro_profit_target_pct": 0.12,
 
         # --------------------------------------------------
         # OPTIONS ELIGIBILITY
@@ -445,6 +458,54 @@ class StockSuggestionStrategy(Strategy):
         "lifecycle_quantity_tolerance": 1e-6,
 
         # --------------------------------------------------
+        # OPTIONAL ALPACA PAPER ENTRY EXECUTION
+        # --------------------------------------------------
+
+        # PAPER execution is opt-in at runtime and is hard-blocked
+        # when ALPACA_IS_PAPER is false. The strategy submits only
+        # DAY limit ENTRY orders in this phase; no live-account,
+        # replace, cancel, close, or exit-order API is used here.
+        "paper_execution_limit_price_round_decimals": 2,
+
+        # Keep a second internal cap even though position sizing
+        # already limits actionable alerts per run.
+        "paper_execution_max_orders_per_run": 5,
+
+        # --------------------------------------------------
+        # OPTIONAL ALPACA PAPER EXIT EXECUTION
+        # --------------------------------------------------
+
+        # Exit execution is armed separately from entry execution so
+        # upgrading the strategy cannot silently turn prior CLOSE
+        # alerts into broker writes. Only PAPER DAY limit exits are
+        # supported. A debit spread is closed for a credit using
+        # Alpaca's signed MLEG convention (negative limit = credit).
+        "paper_exit_execution_limit_price_round_decimals": 2,
+        "paper_exit_execution_max_orders_per_run": 5,
+
+        # --------------------------------------------------
+        # ORDER LIFECYCLE HARDENING
+        # --------------------------------------------------
+
+        # Broker order fills and position snapshots can arrive a few
+        # seconds apart. Do not immediately ORPHAN a lifecycle merely
+        # because an order reports a fill before the matching position
+        # snapshot catches up. After this grace period, a persistent
+        # order/position contradiction is treated as an anomaly.
+        "lifecycle_fill_position_sync_grace_seconds": 120.0,
+
+        # Partial ENTRY fills are accepted as a smaller position. The
+        # unfilled remainder is never topped up automatically after the
+        # entry order becomes terminal. A later independent setup must
+        # come through the normal scanner/risk pipeline.
+        "paper_entry_partial_fill_policy": "KEEP_PARTIAL_NO_TOP_UP",
+
+        # A terminal CLOSE order that leaves broker exposure may be
+        # retried only on a later trading date. This deliberately avoids
+        # repeated same-day submissions/chasing after reject/cancel/expiry.
+        "paper_exit_terminal_retry_policy": "NEXT_TRADING_DATE",
+
+        # --------------------------------------------------
         # ALERT GENERATION
         # --------------------------------------------------
 
@@ -458,15 +519,57 @@ class StockSuggestionStrategy(Strategy):
         "alert_once_per_day": True,
 
         # --------------------------------------------------
+        # TRADE JOURNAL + ANALYTICS
+        # --------------------------------------------------
+
+        # Journal rows are regenerated/upserted from the persistent lifecycle
+        # ledger, so the lifecycle file remains the source of truth.
+        "trade_journal_enabled": True,
+
+        # Log a compact analytics summary only when the completed/open trade
+        # counts or realized P/L change.
+        "trade_journal_log_summary": True,
+
+        # --------------------------------------------------
+        # PRODUCTION SAFETY / HARDENING
+        # --------------------------------------------------
+
+        # The lifecycle ledger is backed up before material overwrites and
+        # validated on every load/save. Corrupt primary state is recovered
+        # automatically from the newest valid backup when possible.
+        "trade_state_backup_enabled": True,
+        "trade_state_backup_max_files": 25,
+        "trade_state_backup_min_interval_seconds": 60.0,
+        "trade_state_fail_fast_on_unrecoverable": True,
+
+        # Startup health failures block NEW entries but never block lifecycle
+        # reconciliation or exits for positions already open.
+        "startup_health_block_new_entries": True,
+
+        # Daily circuit breakers are deliberately conservative. They only
+        # block NEW entries; existing positions remain managed and closable.
+        "circuit_breaker_enabled": True,
+        "circuit_breaker_max_daily_realized_loss_pct_equity": 0.01,
+        "circuit_breaker_max_daily_equity_drawdown_pct": 0.02,
+        "circuit_breaker_max_new_entries_per_day": 5,
+        "circuit_breaker_max_consecutive_losses": 3,
+        "circuit_breaker_halt_on_orphaned": True,
+
+        # Operational reporting is intentionally read-only. The daily summary
+        # is an atomically replaced snapshot; anomalies are append-only JSONL.
+        "daily_operational_summary_enabled": True,
+        "trading_anomaly_log_enabled": True,
+
+        # --------------------------------------------------
         # EXIT MANAGEMENT
         # --------------------------------------------------
 
-        # Close when the conservative mark reaches +50%
-        # versus the alert-estimated entry debit.
+        # Close when the conservative executable mark reaches +50%
+        # versus the broker-confirmed actual entry debit.
         "exit_profit_target_pct": 0.50,
 
-        # Close when the conservative mark reaches -50%
-        # versus the alert-estimated entry debit.
+        # Close when the conservative executable mark reaches -50%
+        # versus the broker-confirmed actual entry debit.
         "exit_max_loss_pct": 0.50,
 
         # Hard time-to-expiration exit.
@@ -509,9 +612,16 @@ class StockSuggestionStrategy(Strategy):
         # another full day at the same unusable time.
         "options_closed_retry_sleeptime": "15M",
 
-        # After a valid in-session full scan, return to the
-        # original once-per-day cadence.
+        # Logical full-scanner policy retained for compatibility/documentation.
+        # This no longer drives LumiBot's framework scheduler; full scanning is
+        # throttled internally to once per market date.
         "options_active_sleeptime": "1D",
+
+        # FIXED LumiBot framework driver cadence. Keep this at 1M so the live
+        # scheduler cannot strand working orders/open positions until tomorrow.
+        # Expensive work is throttled internally; this does NOT mean a full
+        # universe/options scan every minute.
+        "options_management_sleeptime": "1M",
 
         # --------------------------------------------------
         # OPTION QUOTE FRESHNESS
@@ -528,15 +638,28 @@ class StockSuggestionStrategy(Strategy):
     }
 
     def initialize(self):
+        # LumiBot's live scheduler snapshots sleeptime for the next wakeup
+        # before later on_trading_iteration() changes can reliably affect it.
+        # Keep the framework driver permanently fast and throttle expensive
+        # work inside the strategy instead of dynamically changing sleeptime.
         self.sleeptime = (
             self.parameters[
-                "options_active_sleeptime"
+                "options_management_sleeptime"
             ]
         )
 
         # Updated from Alpaca's market clock whenever the
         # options-session gate is checked.
         self._option_quote_reference_time = None
+
+        # The expensive stock/options scanner is intentionally separate
+        # from broker/order/exit management cadence. A process restart may
+        # perform one fresh scan, but once a scan completes for a market
+        # date, intraday wakeups are management-only.
+        self._last_full_scan_market_date = None
+        self._runtime_cadence_label = None
+        self._last_closed_market_reconcile_at = None
+        self._closed_gate_skip_logged = False
 
         api_key = os.environ["ALPACA_API_KEY"]
         api_secret = os.environ["ALPACA_API_SECRET"]
@@ -548,6 +671,8 @@ class StockSuggestionStrategy(Strategy):
             ).lower()
             == "true"
         )
+
+        self.alpaca_is_paper = bool(paper)
 
         self.alpaca_trading_client = TradingClient(
             api_key,
@@ -741,6 +866,247 @@ class StockSuggestionStrategy(Strategy):
         )
 
         # --------------------------------------------------
+        # OPTIONAL PAPER ENTRY EXECUTION
+        # --------------------------------------------------
+        #
+        # Requires BOTH:
+        #   PAPER_EXECUTION_ENABLED=true
+        #   PAPER_EXECUTION_ARM=PAPER_ONLY
+        #
+        # ALPACA_IS_PAPER must also be true. This two-key arm
+        # prevents an accidental environment edit from enabling
+        # broker writes. Only option ENTRY limit orders are submitted
+        # in this phase. Micro-account simulation remains alert-only.
+        # --------------------------------------------------
+
+        self.paper_execution_enabled = (
+            os.environ.get(
+                "PAPER_EXECUTION_ENABLED",
+                "false",
+            )
+            .strip()
+            .lower()
+            in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+        )
+
+        self.paper_execution_arm = (
+            os.environ.get(
+                "PAPER_EXECUTION_ARM",
+                "",
+            )
+            .strip()
+            .upper()
+        )
+
+        self.paper_execution_armed = (
+            self.paper_execution_enabled
+            and self.paper_execution_arm == "PAPER_ONLY"
+        )
+
+        if self.paper_execution_enabled and not self.alpaca_is_paper:
+            raise ValueError(
+                "PAPER_EXECUTION_ENABLED=true is forbidden when "
+                "ALPACA_IS_PAPER is not true. No live-account "
+                "execution is permitted by this strategy build."
+            )
+
+        if (
+            self.paper_execution_enabled
+            and self.paper_execution_arm != "PAPER_ONLY"
+        ):
+            self.log_message(
+                "PAPER EXECUTION requested but NOT ARMED: set "
+                "PAPER_EXECUTION_ARM=PAPER_ONLY to allow PAPER "
+                "option entry submissions. Remaining alert-only."
+            )
+        elif self.paper_execution_armed:
+            self.log_message(
+                "PAPER EXECUTION ARMED: option ENTRY orders may be "
+                "submitted to Alpaca PAPER as DAY limit orders. "
+                "Close orders remain separately gated by the PAPER EXIT arm; "
+                "no live, replace, cancel, or exercise orders are enabled."
+            )
+
+        self._paper_execution_orders_submitted_this_run = 0
+
+        # --------------------------------------------------
+        # OPTIONAL PAPER EXIT EXECUTION
+        # --------------------------------------------------
+        #
+        # Requires BOTH:
+        #   PAPER_EXIT_EXECUTION_ENABLED=true
+        #   PAPER_EXIT_EXECUTION_ARM=PAPER_ONLY
+        #
+        # This arm is intentionally independent from entry execution.
+        # Existing broker-confirmed PAPER positions can therefore be
+        # managed without enabling new entries, and an existing entry
+        # arm does not unexpectedly start sending close orders.
+        # --------------------------------------------------
+
+        self.paper_exit_execution_enabled = (
+            os.environ.get(
+                "PAPER_EXIT_EXECUTION_ENABLED",
+                "false",
+            )
+            .strip()
+            .lower()
+            in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+        )
+
+        self.paper_exit_execution_arm = (
+            os.environ.get(
+                "PAPER_EXIT_EXECUTION_ARM",
+                "",
+            )
+            .strip()
+            .upper()
+        )
+
+        self.paper_exit_execution_armed = (
+            self.paper_exit_execution_enabled
+            and self.paper_exit_execution_arm == "PAPER_ONLY"
+        )
+
+        if (
+            self.paper_exit_execution_enabled
+            and not self.alpaca_is_paper
+        ):
+            raise ValueError(
+                "PAPER_EXIT_EXECUTION_ENABLED=true is forbidden when "
+                "ALPACA_IS_PAPER is not true. No live-account exit "
+                "execution is permitted by this strategy build."
+            )
+
+        if (
+            self.paper_exit_execution_enabled
+            and self.paper_exit_execution_arm != "PAPER_ONLY"
+        ):
+            self.log_message(
+                "PAPER EXIT EXECUTION requested but NOT ARMED: set "
+                "PAPER_EXIT_EXECUTION_ARM=PAPER_ONLY to allow PAPER "
+                "option close submissions. Remaining exit-alert only."
+            )
+        elif self.paper_exit_execution_armed:
+            self.log_message(
+                "PAPER EXIT EXECUTION ARMED: broker-confirmed option "
+                "CLOSE signals may submit Alpaca PAPER DAY limit orders. "
+                "No live, replace, cancel, or exercise orders are enabled."
+            )
+
+        self._paper_exit_orders_submitted_this_run = 0
+
+        # --------------------------------------------------
+        # CONTROLLED PAPER-ONLY EXIT VALIDATION
+        # --------------------------------------------------
+        #
+        # This deliberately reuses the real production CLOSE pipeline.
+        # It does not alter profit/loss/DTE/thesis thresholds. Instead, when
+        # fully armed during an allowed options session, it converts exactly
+        # one broker-confirmed lifecycle for PAPER_EXIT_TEST_SYMBOL into a
+        # one-shot CLOSE action. The token is persisted before submission, so
+        # restarts cannot repeatedly force the same validation close.
+        #
+        # Requires the normal PAPER exit arm plus ALL of:
+        #   PAPER_EXIT_TEST_ENABLED=true
+        #   PAPER_EXIT_TEST_ARM=FORCE_PAPER_CLOSE
+        #   PAPER_EXIT_TEST_SYMBOL=OWL
+        #   PAPER_EXIT_TEST_TOKEN=OWL_EXIT_TEST_001
+        # --------------------------------------------------
+
+        self.paper_exit_test_enabled = (
+            os.environ.get(
+                "PAPER_EXIT_TEST_ENABLED",
+                "false",
+            )
+            .strip()
+            .lower()
+            in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+        )
+
+        self.paper_exit_test_arm = (
+            os.environ.get(
+                "PAPER_EXIT_TEST_ARM",
+                "",
+            )
+            .strip()
+            .upper()
+        )
+
+        self.paper_exit_test_symbol = (
+            os.environ.get(
+                "PAPER_EXIT_TEST_SYMBOL",
+                "",
+            )
+            .strip()
+            .upper()
+        )
+
+        self.paper_exit_test_token = (
+            os.environ.get(
+                "PAPER_EXIT_TEST_TOKEN",
+                "",
+            )
+            .strip()
+        )
+
+        self.paper_exit_test_armed = (
+            self.paper_exit_test_enabled
+            and self.paper_exit_test_arm == "FORCE_PAPER_CLOSE"
+            and bool(self.paper_exit_test_symbol)
+            and bool(self.paper_exit_test_token)
+        )
+
+        if self.paper_exit_test_enabled and not self.alpaca_is_paper:
+            raise ValueError(
+                "PAPER_EXIT_TEST_ENABLED=true is forbidden when "
+                "ALPACA_IS_PAPER is not true. Controlled exit tests "
+                "can never run against a live account."
+            )
+
+        if self.paper_exit_test_enabled and not self.paper_exit_execution_armed:
+            raise ValueError(
+                "Controlled PAPER exit validation requires the normal "
+                "PAPER_EXIT_EXECUTION_ENABLED=true and "
+                "PAPER_EXIT_EXECUTION_ARM=PAPER_ONLY safeguards."
+            )
+
+        if self.paper_exit_test_enabled and not self.paper_exit_test_armed:
+            self.log_message(
+                "CONTROLLED PAPER EXIT TEST requested but NOT ARMED: set "
+                "PAPER_EXIT_TEST_ARM=FORCE_PAPER_CLOSE plus an exact "
+                "PAPER_EXIT_TEST_SYMBOL and non-empty PAPER_EXIT_TEST_TOKEN."
+            )
+        elif self.paper_exit_test_armed:
+            token_fingerprint = hashlib.sha256(
+                self.paper_exit_test_token.encode("utf-8")
+            ).hexdigest()[:10]
+            self.log_message(
+                "CONTROLLED PAPER EXIT TEST ARMED: exact underlying="
+                f"{self.paper_exit_test_symbol}; token_sha256={token_fingerprint}; "
+                "one broker-confirmed active lifecycle may be forced through "
+                "the real Alpaca PAPER close pipeline during an allowed options "
+                "session. The token is one-shot and restart-safe."
+            )
+
+        # --------------------------------------------------
         # PERSISTENT ALERT DEDUPLICATION
         # --------------------------------------------------
         #
@@ -807,7 +1173,117 @@ class StockSuggestionStrategy(Strategy):
 
         self._tracked_alert_positions = {}
 
+        # --------------------------------------------------
+        # PRODUCTION SAFETY / HARDENING RUNTIME PATHS
+        # --------------------------------------------------
+        self.trade_state_backup_enabled = self._env_bool(
+            "TRADE_STATE_BACKUP_ENABLED",
+            self.parameters.get("trade_state_backup_enabled", True),
+        )
+        self.trade_state_backup_dir = os.environ.get(
+            "TRADE_STATE_BACKUP_DIR",
+            (self.trade_alert_positions_path + ".backups")
+            if self.trade_alert_positions_path
+            else ".trade_alert_positions.backups",
+        ).strip()
+        self.trade_state_backup_max_files = max(
+            3,
+            self._env_int(
+                "TRADE_STATE_BACKUP_MAX_FILES",
+                self.parameters.get("trade_state_backup_max_files", 25),
+            ),
+        )
+        self.trade_state_backup_min_interval_seconds = max(
+            0.0,
+            self._env_float(
+                "TRADE_STATE_BACKUP_MIN_INTERVAL_SECONDS",
+                self.parameters.get("trade_state_backup_min_interval_seconds", 60.0),
+            ),
+        )
+        self.trade_state_fail_fast_on_unrecoverable = self._env_bool(
+            "TRADE_STATE_FAIL_FAST_ON_UNRECOVERABLE",
+            self.parameters.get("trade_state_fail_fast_on_unrecoverable", True),
+        )
+        self.startup_health_report_path = os.environ.get(
+            "STARTUP_HEALTH_REPORT_PATH",
+            "startup_health.json",
+        ).strip()
+        self.daily_trading_summary_path = os.environ.get(
+            "DAILY_TRADING_SUMMARY_PATH",
+            "daily_trading_summary.json",
+        ).strip()
+        self.trading_anomalies_jsonl_path = os.environ.get(
+            "TRADING_ANOMALIES_JSONL_PATH",
+            "trading_anomalies.jsonl",
+        ).strip()
+        self.trading_circuit_breaker_state_path = os.environ.get(
+            "TRADING_CIRCUIT_BREAKER_STATE_PATH",
+            ".trading_circuit_breakers.json",
+        ).strip()
+        self.trading_kill_switch_file = os.environ.get(
+            "TRADING_KILL_SWITCH_FILE",
+            ".trading_kill_switch",
+        ).strip()
+        self._lifecycle_state_integrity_ok = True
+        self._lifecycle_state_recovered_from_backup = False
+        self._lifecycle_state_recovery_reason = ""
+        self._last_trade_state_backup_at = None
+        self._startup_health_results = []
+        self.startup_health_entries_allowed = False
+        self._entry_execution_blocked_reasons = []
+        self._last_circuit_breaker_log_signature = None
+        self._trading_circuit_breaker_state = {}
+        self._circuit_breaker_state_integrity_ok = True
+        self._circuit_breaker_state_integrity_reason = ""
+        self._anomaly_emitted_keys = set()
+        self._last_daily_summary_log_signature = None
+        self._load_recent_anomaly_keys()
+
         self._load_trade_alert_positions_state()
+
+        # --------------------------------------------------
+        # TRADE JOURNAL + ANALYTICS OUTPUTS
+        # --------------------------------------------------
+        # Optional .env:
+        #   TRADE_JOURNAL_CSV_PATH=trade_journal.csv
+        #   TRADE_ANALYTICS_JSON_PATH=trade_analytics.json
+        #
+        # The CSV is a canonical one-row-per-executed-lifecycle snapshot.
+        # It is rebuilt atomically from the lifecycle ledger, making restart
+        # recovery deterministic and avoiding duplicate journal rows.
+        # --------------------------------------------------
+
+        self.trade_journal_csv_path = (
+            os.environ.get(
+                "TRADE_JOURNAL_CSV_PATH",
+                "trade_journal.csv",
+            ).strip()
+        )
+
+        self.trade_analytics_json_path = (
+            os.environ.get(
+                "TRADE_ANALYTICS_JSON_PATH",
+                "trade_analytics.json",
+            ).strip()
+        )
+
+        self._last_trade_analytics_log_signature = None
+
+        self._load_trading_circuit_breaker_state()
+
+        self.log_message(
+            "TRADE JOURNAL ENABLED: canonical lifecycle-derived CSV="
+            f"{self.trade_journal_csv_path or 'DISABLED'}; analytics JSON="
+            f"{self.trade_analytics_json_path or 'DISABLED'}."
+        )
+
+        self.log_message(
+            "FRAMEWORK SCHEDULER DRIVER: fixed at "
+            f"{self.sleeptime}. Full stock/options scanning is internally "
+            "limited to once per market date; closed-market broker "
+            f"reconciliation is throttled to "
+            f"{self.parameters['options_closed_retry_sleeptime']}."
+        )
 
         # --------------------------------------------------
         # IV HISTORY + EVENT-RISK RUNTIME STATE
@@ -931,6 +1407,11 @@ class StockSuggestionStrategy(Strategy):
                 "Could not determine Alpaca "
                 f"options trading level: {exc}"
             )
+
+        # Health checks never stop management/exits for existing exposure.
+        # Any FAIL only blocks NEW entries.
+        self._run_startup_health_check()
+
     @staticmethod
     def _is_fund_or_leveraged_product(asset):
         """
@@ -5384,8 +5865,9 @@ class StockSuggestionStrategy(Strategy):
         Return True when the account's known Alpaca options
         level meets the requested level.
 
-        If Alpaca did not return a level, keep analysis
-        enabled because this scanner does not place orders.
+        If Alpaca did not return a level, keep ANALYSIS enabled.
+        The optional PAPER execution layer independently fails closed
+        unless a sufficient numeric options level is known.
         """
 
         level = self.options_trading_level
@@ -8388,8 +8870,11 @@ class StockSuggestionStrategy(Strategy):
                         or 0.0
                     ),
 
-                "mode":
-                    "ALERT_ONLY_NO_ORDER",
+                "mode": (
+                    "ALPACA_PAPER_ENTRY_EXECUTION"
+                    if self.paper_execution_armed
+                    else "ALERT_ONLY_NO_ORDER"
+                ),
             }
 
             self.log_message(
@@ -8428,10 +8913,6 @@ class StockSuggestionStrategy(Strategy):
                 f"{payload['stock_score']:.1f}\n"
                 "MODE: ALERT ONLY - NO ORDER SUBMITTED\n"
                 "================================"
-            )
-
-            self._append_trade_alert_jsonl(
-                payload
             )
 
             if self.parameters[
@@ -8733,6 +9214,7 @@ class StockSuggestionStrategy(Strategy):
             "REJECTED",
             "EXPIRED",
             "STALE_UNCONFIRMED",
+            "SUPERSEDED",
         }
 
 
@@ -9524,6 +10006,11 @@ class StockSuggestionStrategy(Strategy):
                             "filled_avg_price",
                             None,
                         ),
+                        "ratio_qty": self._broker_field(
+                            leg,
+                            "ratio_qty",
+                            1.0,
+                        ),
                         "status": (
                             self._enum_text(
                                 self._broker_field(
@@ -9574,10 +10061,46 @@ class StockSuggestionStrategy(Strategy):
                         or ""
                     ),
                     "status": top_status,
+                    "qty": self._lifecycle_float(
+                        self._broker_field(
+                            order,
+                            "qty",
+                            0.0,
+                        ),
+                        0.0,
+                    ) or 0.0,
                     "submitted_at": self._parse_lifecycle_datetime(
                         self._broker_field(
                             order,
                             "submitted_at",
+                            None,
+                        )
+                    ),
+                    "updated_at": self._parse_lifecycle_datetime(
+                        self._broker_field(
+                            order,
+                            "updated_at",
+                            None,
+                        )
+                    ),
+                    "expired_at": self._parse_lifecycle_datetime(
+                        self._broker_field(
+                            order,
+                            "expired_at",
+                            None,
+                        )
+                    ),
+                    "canceled_at": self._parse_lifecycle_datetime(
+                        self._broker_field(
+                            order,
+                            "canceled_at",
+                            None,
+                        )
+                    ),
+                    "failed_at": self._parse_lifecycle_datetime(
+                        self._broker_field(
+                            order,
+                            "failed_at",
                             None,
                         )
                     ),
@@ -9812,6 +10335,7 @@ class StockSuggestionStrategy(Strategy):
         position,
         normalized_orders,
         close=False,
+        claim_owners=None,
     ):
 
         expected_legs = (
@@ -9844,7 +10368,135 @@ class StockSuggestionStrategy(Strategy):
 
         matches = []
 
+        # If this lifecycle has an explicitly linked broker order,
+        # exact order/client IDs are authoritative. This avoids
+        # accidentally attaching a manual order that happens to use
+        # the same option legs. Fall back to leg/time matching only
+        # when no explicit linked order is present in the snapshot.
+        prefix = (
+            "close"
+            if close
+            else "entry"
+        )
+
+        linked_order_id = str(
+            position.get(
+                f"broker_{prefix}_order_id",
+                "",
+            )
+            or ""
+        )
+
+        linked_client_order_id = str(
+            position.get(
+                f"broker_{prefix}_client_order_id",
+                "",
+            )
+            or ""
+        )
+
+        if linked_order_id or linked_client_order_id:
+            exact_matches = [
+                order
+                for order in normalized_orders
+                if (
+                    linked_order_id
+                    and str(order.get("id", "") or "")
+                    == linked_order_id
+                )
+                or (
+                    linked_client_order_id
+                    and str(
+                        order.get(
+                            "client_order_id",
+                            "",
+                        )
+                        or ""
+                    )
+                    == linked_client_order_id
+                )
+            ]
+
+            exact_matches.sort(
+                key=lambda row: (
+                    row.get("submitted_at")
+                    or datetime.min.replace(
+                        tzinfo=timezone.utc
+                    )
+                )
+            )
+
+            # Once an explicit order/client ID is assigned, do not
+            # fall back to heuristic leg matching. An empty exact
+            # result means the linked order is absent from this
+            # snapshot, not that a manual same-leg order should be
+            # adopted by this lifecycle.
+            return exact_matches
+
+        current_position_id = str(
+            position.get(
+                "id",
+                "",
+            )
+            or ""
+        )
+
+        order_id_owners = {}
+        client_id_owners = {}
+
+        if claim_owners:
+            prefix_owners = claim_owners.get(
+                prefix,
+                {},
+            )
+            order_id_owners = prefix_owners.get(
+                "order_id_owner",
+                {},
+            )
+            client_id_owners = prefix_owners.get(
+                "client_id_owner",
+                {},
+            )
+
         for order in normalized_orders:
+
+            broker_order_id = str(
+                order.get(
+                    "id",
+                    "",
+                )
+                or ""
+            )
+
+            broker_client_order_id = str(
+                order.get(
+                    "client_order_id",
+                    "",
+                )
+                or ""
+            )
+
+            claimed_owner = (
+                order_id_owners.get(
+                    broker_order_id
+                )
+                if broker_order_id
+                else None
+            )
+
+            if claimed_owner is None and broker_client_order_id:
+                claimed_owner = client_id_owners.get(
+                    broker_client_order_id
+                )
+
+            if (
+                claimed_owner
+                and claimed_owner != current_position_id
+            ):
+                # Explicit broker links are exclusive. A heuristic
+                # same-leg/time match may not steal an order already
+                # owned by another lifecycle.
+                continue
 
             submitted_at = order.get(
                 "submitted_at"
@@ -9895,6 +10547,9 @@ class StockSuggestionStrategy(Strategy):
             "held",
             "pending_replace",
             "pending_cancel",
+            # Alpaca documents STOPPED as a guaranteed trade that has
+            # not executed yet, so it remains broker-working evidence.
+            "stopped",
         }
 
         terminal_statuses = {
@@ -9902,7 +10557,7 @@ class StockSuggestionStrategy(Strategy):
             "expired",
             "rejected",
             "done_for_day",
-            "stopped",
+            "calculated",
             "suspended",
             "replaced",
         }
@@ -9955,6 +10610,1131 @@ class StockSuggestionStrategy(Strategy):
                 result["terminal"] = order
 
         return result
+
+
+    def _classify_lifecycle_order(
+        self,
+        order,
+    ):
+        """Classify one normalized Alpaca order for lifecycle policy.
+
+        The classification intentionally separates a terminal unfilled
+        remainder from the exposure created by any partial fill.
+        """
+
+        if not order:
+            return {
+                "category": "NONE",
+                "status": "",
+                "requested_qty": 0.0,
+                "filled_qty": 0.0,
+                "remaining_qty": 0.0,
+                "has_fill": False,
+                "working": False,
+                "terminal": False,
+                "retryable_terminal": False,
+            }
+
+        status = str(
+            order.get(
+                "status",
+                "",
+            )
+            or ""
+        ).lower()
+
+        requested_qty = self._lifecycle_float(
+            order.get(
+                "qty",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        filled_qty = self._lifecycle_float(
+            order.get(
+                "filled_qty",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        tolerance = max(
+            0.0,
+            float(
+                self.parameters.get(
+                    "lifecycle_quantity_tolerance",
+                    1e-6,
+                )
+            ),
+        )
+
+        remaining_qty = max(
+            0.0,
+            requested_qty - filled_qty,
+        )
+
+        has_fill = filled_qty > tolerance
+
+        if (
+            status == "filled"
+            or (
+                requested_qty > tolerance
+                and remaining_qty <= tolerance
+                and has_fill
+            )
+        ):
+            category = "FILLED"
+            working = False
+            terminal = True
+            retryable_terminal = False
+
+        elif status in {
+            "new",
+            "accepted",
+            "pending_new",
+            "accepted_for_bidding",
+            "pending_review",
+            "held",
+            "pending_replace",
+            "pending_cancel",
+            "stopped",
+            "partially_filled",
+        }:
+            category = (
+                "PARTIAL_WORKING"
+                if has_fill
+                else "WORKING"
+            )
+            working = True
+            terminal = False
+            retryable_terminal = False
+
+        elif status == "rejected":
+            category = (
+                "PARTIAL_REJECTED"
+                if has_fill
+                else "REJECTED"
+            )
+            working = False
+            terminal = True
+            retryable_terminal = True
+
+        elif status == "canceled":
+            category = (
+                "PARTIAL_CANCELED"
+                if has_fill
+                else "CANCELED"
+            )
+            working = False
+            terminal = True
+            retryable_terminal = True
+
+        elif status in {
+            "expired",
+            "done_for_day",
+            "calculated",
+        }:
+            category = (
+                "PARTIAL_EXPIRED"
+                if has_fill
+                else "EXPIRED"
+            )
+            working = False
+            terminal = True
+            retryable_terminal = True
+
+        elif status == "suspended":
+            category = (
+                "PARTIAL_SUSPENDED"
+                if has_fill
+                else "SUSPENDED"
+            )
+            working = False
+            terminal = True
+            retryable_terminal = False
+
+        elif status == "replaced":
+            category = (
+                "PARTIAL_REPLACED"
+                if has_fill
+                else "REPLACED"
+            )
+            working = False
+            terminal = True
+            retryable_terminal = False
+
+        else:
+            category = (
+                "PARTIAL_UNKNOWN"
+                if has_fill
+                else "UNKNOWN"
+            )
+            working = False
+            terminal = False
+            retryable_terminal = False
+
+        return {
+            "category": category,
+            "status": status,
+            "requested_qty": float(requested_qty),
+            "filled_qty": float(filled_qty),
+            "remaining_qty": float(remaining_qty),
+            "has_fill": bool(has_fill),
+            "working": bool(working),
+            "terminal": bool(terminal),
+            "retryable_terminal": bool(retryable_terminal),
+        }
+
+
+    def _persist_order_outcome_metadata(
+        self,
+        position,
+        prefix,
+        evidence,
+        expected_quantity,
+        now,
+    ):
+        """Persist requested/filled/remainder policy for entry or close."""
+
+        latest = evidence.get(
+            "latest"
+        )
+
+        outcome = self._classify_lifecycle_order(
+            latest
+        )
+
+        requested_qty = outcome[
+            "requested_qty"
+        ]
+
+        if requested_qty <= 0:
+            requested_qty = max(
+                0.0,
+                float(
+                    expected_quantity
+                    or 0.0
+                ),
+            )
+
+        filled_qty = outcome[
+            "filled_qty"
+        ]
+        remaining_qty = max(
+            0.0,
+            requested_qty - filled_qty,
+        )
+
+        position[
+            f"broker_{prefix}_order_outcome"
+        ] = outcome[
+            "category"
+        ]
+        position[
+            f"broker_{prefix}_requested_qty"
+        ] = requested_qty
+        position[
+            f"broker_{prefix}_unfilled_qty"
+        ] = remaining_qty
+
+        terminal_remainder = (
+            outcome[
+                "terminal"
+            ]
+            and remaining_qty > max(
+                0.0,
+                float(
+                    self.parameters.get(
+                        "lifecycle_quantity_tolerance",
+                        1e-6,
+                    )
+                ),
+            )
+        )
+
+        position[
+            f"broker_{prefix}_terminal_remainder"
+        ] = bool(
+            terminal_remainder
+        )
+
+        if prefix == "entry":
+            if (
+                outcome[
+                    "has_fill"
+                ]
+                and terminal_remainder
+            ):
+                position[
+                    "paper_entry_remainder_policy"
+                ] = str(
+                    self.parameters.get(
+                        "paper_entry_partial_fill_policy",
+                        "KEEP_PARTIAL_NO_TOP_UP",
+                    )
+                )
+                position[
+                    "paper_entry_top_up_allowed"
+                ] = False
+
+        elif prefix == "close":
+            if (
+                outcome[
+                    "terminal"
+                ]
+                and outcome[
+                    "retryable_terminal"
+                ]
+                and remaining_qty > 0
+            ):
+                submitted_at = (
+                    latest.get(
+                        "submitted_at"
+                    )
+                    if latest
+                    else None
+                )
+
+                base_date = (
+                    submitted_at.date()
+                    if isinstance(
+                        submitted_at,
+                        datetime,
+                    )
+                    else now.date()
+                )
+
+                retry_after = (
+                    base_date
+                    + timedelta(
+                        days=1
+                    )
+                )
+
+                position[
+                    "paper_exit_retry_policy"
+                ] = str(
+                    self.parameters.get(
+                        "paper_exit_terminal_retry_policy",
+                        "NEXT_TRADING_DATE",
+                    )
+                )
+                position[
+                    "paper_exit_retry_after_date"
+                ] = retry_after.isoformat()
+                position[
+                    "paper_exit_retry_eligible"
+                ] = bool(
+                    now.date()
+                    >= retry_after
+                )
+                position[
+                    "paper_exit_retry_reason"
+                ] = outcome[
+                    "category"
+                ]
+            elif outcome[
+                "working"
+            ] or (
+                outcome[
+                    "terminal"
+                ]
+                and remaining_qty <= 0
+            ):
+                position[
+                    "paper_exit_retry_eligible"
+                ] = False
+                position[
+                    "paper_exit_retry_after_date"
+                ] = ""
+                position[
+                    "paper_exit_retry_reason"
+                ] = ""
+
+        return outcome
+
+
+    def _order_position_sync_grace_active(
+        self,
+        position,
+        prefix,
+        order,
+        now,
+    ):
+        """Allow short broker order/position eventual-consistency lag."""
+
+        if not order:
+            return False
+
+        key = (
+            f"broker_{prefix}_fill_position_wait_started_at"
+        )
+
+        started = self._parse_lifecycle_datetime(
+            position.get(
+                key,
+                None,
+            )
+        )
+
+        if started is None:
+            started = now
+            position[
+                key
+            ] = started.isoformat()
+
+        grace_seconds = max(
+            0.0,
+            float(
+                self.parameters.get(
+                    "lifecycle_fill_position_sync_grace_seconds",
+                    120.0,
+                )
+            ),
+        )
+
+        age_seconds = max(
+            0.0,
+            (
+                now - started
+            ).total_seconds(),
+        )
+
+        return age_seconds <= grace_seconds
+
+
+    @staticmethod
+    def _lifecycle_float(
+        value,
+        default=None,
+    ):
+        try:
+            if value is None:
+                return default
+            result = float(value)
+            if not math.isfinite(result):
+                return default
+            return result
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return default
+
+
+    def _normalized_order_fill_economics(
+        self,
+        order,
+        position,
+        close=False,
+    ):
+        """Return broker fill quantity/value for a supported option order.
+
+        Entry value is a debit/share. Close value is cash received/share.
+        MLEG leg fills are preferred because they make the economics
+        unambiguous; Alpaca's signed top-level net fill is a fallback.
+        """
+
+        if not order:
+            return None
+
+        short_symbol = str(
+            position.get(
+                "short_contract",
+                "",
+            )
+            or ""
+        ).upper()
+        is_mleg = bool(short_symbol)
+
+        filled_qty = self._lifecycle_float(
+            order.get(
+                "filled_qty",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        top_fill = self._lifecycle_float(
+            order.get(
+                "filled_avg_price",
+                None,
+            ),
+            None,
+        )
+
+        def top_result():
+            if (
+                filled_qty <= 0
+                or top_fill is None
+                or abs(top_fill) <= 1e-12
+            ):
+                return None
+
+            if is_mleg:
+                # Alpaca MLEG net prices use signed economics:
+                # positive debit, negative credit.
+                value = -top_fill if close else top_fill
+            else:
+                # Single-leg option fills are positive option prices;
+                # a sell-to-close fill therefore represents credit received.
+                value = top_fill
+
+            if (
+                not close
+                and value <= 0
+            ):
+                return None
+
+            return {
+                "filled_qty": float(filled_qty),
+                "value_per_share": float(value),
+                "source": "BROKER_ORDER_TOP_FILL",
+                "filled_at": order.get(
+                    "filled_at"
+                ),
+                "order_id": str(
+                    order.get(
+                        "id",
+                        "",
+                    )
+                    or ""
+                ),
+                "client_order_id": str(
+                    order.get(
+                        "client_order_id",
+                        "",
+                    )
+                    or ""
+                ),
+            }
+
+        if not is_mleg:
+            return top_result()
+
+        # Prefer individual MLEG fill prices. This avoids depending on
+        # any ambiguity in the sign of a top-level average fill response.
+        legs = order.get(
+            "legs",
+            [],
+        ) or []
+
+        if not legs:
+            return top_result()
+
+        signed_debit = 0.0
+        leg_fill_quantities = []
+        usable_legs = 0
+
+        for leg in legs:
+            price = self._lifecycle_float(
+                leg.get(
+                    "filled_avg_price",
+                    None,
+                ),
+                None,
+            )
+
+            if (
+                price is None
+                or price < 0
+            ):
+                continue
+
+            ratio = self._lifecycle_float(
+                leg.get(
+                    "ratio_qty",
+                    1.0,
+                ),
+                1.0,
+            ) or 1.0
+
+            if ratio <= 0:
+                ratio = 1.0
+
+            leg_filled_qty = self._lifecycle_float(
+                leg.get(
+                    "filled_qty",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0
+
+            side = str(
+                leg.get(
+                    "side",
+                    "",
+                )
+                or ""
+            ).lower()
+
+            if side == "buy":
+                signed_debit += price * ratio
+            elif side == "sell":
+                signed_debit -= price * ratio
+            else:
+                continue
+
+            usable_legs += 1
+
+            if leg_filled_qty > 0:
+                leg_fill_quantities.append(
+                    leg_filled_qty / ratio
+                )
+
+        if usable_legs != len(legs):
+            return top_result()
+
+        effective_qty = filled_qty
+
+        if effective_qty <= 0 and leg_fill_quantities:
+            effective_qty = min(
+                leg_fill_quantities
+            )
+
+        if effective_qty <= 0:
+            return top_result()
+
+        value = (
+            -signed_debit
+            if close
+            else signed_debit
+        )
+
+        if (
+            not close
+            and value <= 0
+        ):
+            return top_result()
+
+        return {
+            "filled_qty": float(effective_qty),
+            "value_per_share": float(value),
+            "source": "BROKER_ORDER_LEG_FILLS",
+            "filled_at": order.get(
+                "filled_at"
+            ),
+            "order_id": str(
+                order.get(
+                    "id",
+                    "",
+                )
+                or ""
+            ),
+            "client_order_id": str(
+                order.get(
+                    "client_order_id",
+                    "",
+                )
+                or ""
+            ),
+        }
+
+    def _broker_position_entry_basis(
+        self,
+        position,
+        snapshot,
+    ):
+        """Fallback to broker position average prices when order fill is absent."""
+
+        details = snapshot.get(
+            "position_details",
+            {},
+        ) or {}
+
+        long_symbol = str(
+            position.get(
+                "long_contract",
+                "",
+            )
+            or ""
+        ).upper()
+
+        short_symbol = str(
+            position.get(
+                "short_contract",
+                "",
+            )
+            or ""
+        ).upper()
+
+        if not long_symbol:
+            return None
+
+        long_detail = details.get(
+            long_symbol,
+            {},
+        ) or {}
+
+        long_price = self._lifecycle_float(
+            long_detail.get(
+                "avg_entry_price",
+                None,
+            ),
+            None,
+        )
+
+        if (
+            long_price is None
+            or long_price <= 0
+        ):
+            return None
+
+        basis = long_price
+
+        if short_symbol:
+            short_detail = details.get(
+                short_symbol,
+                {},
+            ) or {}
+
+            short_price = self._lifecycle_float(
+                short_detail.get(
+                    "avg_entry_price",
+                    None,
+                ),
+                None,
+            )
+
+            if (
+                short_price is None
+                or short_price < 0
+            ):
+                return None
+
+            basis = long_price - short_price
+
+        if basis <= 0:
+            return None
+
+        qty = self._lifecycle_float(
+            position.get(
+                "broker_open_quantity",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        if qty <= 0:
+            return None
+
+        return {
+            "filled_qty": float(qty),
+            "value_per_share": float(basis),
+            "source": "BROKER_POSITION_AVG_ENTRY",
+            "filled_at": None,
+            "order_id": "",
+            "client_order_id": "",
+        }
+
+
+    def _update_lifecycle_fill_accounting(
+        self,
+        position,
+        snapshot,
+        entry_evidence,
+        close_evidence,
+    ):
+        """Persist actual broker entry basis and realized close P/L."""
+
+        if str(
+            position.get(
+                "asset_type",
+                "OPTION",
+            )
+            or "OPTION"
+        ).upper() != "OPTION":
+            return
+
+        prior_entry_basis = self._lifecycle_float(
+            position.get(
+                "actual_entry_debit_per_share",
+                None,
+            ),
+            None,
+        )
+
+        entry_fill = self._normalized_order_fill_economics(
+            entry_evidence.get(
+                "latest"
+            ),
+            position,
+            close=False,
+        )
+
+        if (
+            entry_fill is None
+            and prior_entry_basis is None
+        ):
+            entry_fill = self._broker_position_entry_basis(
+                position,
+                snapshot,
+            )
+
+        if entry_fill is not None:
+            entry_basis = float(
+                entry_fill[
+                    "value_per_share"
+                ]
+            )
+            entry_qty = float(
+                entry_fill[
+                    "filled_qty"
+                ]
+            )
+
+            position[
+                "actual_entry_debit_per_share"
+            ] = entry_basis
+            position[
+                "actual_entry_filled_qty"
+            ] = max(
+                entry_qty,
+                self._lifecycle_float(
+                    position.get(
+                        "actual_entry_filled_qty",
+                        0.0,
+                    ),
+                    0.0,
+                ) or 0.0,
+            )
+            position[
+                "actual_entry_basis_source"
+            ] = entry_fill[
+                "source"
+            ]
+            position[
+                "actual_entry_filled_at"
+            ] = (
+                entry_fill[
+                    "filled_at"
+                ].isoformat()
+                if isinstance(
+                    entry_fill.get(
+                        "filled_at"
+                    ),
+                    datetime,
+                )
+                else str(
+                    entry_fill.get(
+                        "filled_at",
+                        "",
+                    )
+                    or ""
+                )
+            )
+            position[
+                "actual_entry_total_debit"
+            ] = (
+                entry_basis
+                * 100.0
+                * float(
+                    position[
+                        "actual_entry_filled_qty"
+                    ]
+                )
+            )
+
+            if prior_entry_basis is None:
+                self._record_lifecycle_event(
+                    position,
+                    "ACTUAL_ENTRY_BASIS_ESTABLISHED",
+                    "Broker fill/position data established the entry basis",
+                    details={
+                        "debit_per_share": entry_basis,
+                        "filled_qty": entry_qty,
+                        "source": entry_fill[
+                            "source"
+                        ],
+                    },
+                )
+
+        close_fill = self._normalized_order_fill_economics(
+            close_evidence.get(
+                "latest"
+            ),
+            position,
+            close=True,
+        )
+
+        if close_fill is not None:
+            ledger = position.setdefault(
+                "broker_close_fill_ledger",
+                {},
+            )
+
+            order_key = (
+                close_fill.get(
+                    "order_id"
+                )
+                or close_fill.get(
+                    "client_order_id"
+                )
+                or "UNKNOWN_CLOSE_ORDER"
+            )
+
+            old_ledger_row = ledger.get(
+                order_key,
+                {},
+            ) or {}
+
+            ledger[
+                order_key
+            ] = {
+                "filled_qty": float(
+                    close_fill[
+                        "filled_qty"
+                    ]
+                ),
+                "credit_per_share": float(
+                    close_fill[
+                        "value_per_share"
+                    ]
+                ),
+                "source": close_fill[
+                    "source"
+                ],
+                "filled_at": (
+                    close_fill[
+                        "filled_at"
+                    ].isoformat()
+                    if isinstance(
+                        close_fill.get(
+                            "filled_at"
+                        ),
+                        datetime,
+                    )
+                    else str(
+                        close_fill.get(
+                            "filled_at",
+                            "",
+                        )
+                        or ""
+                    )
+                ),
+                "client_order_id": close_fill.get(
+                    "client_order_id",
+                    "",
+                ),
+            }
+
+            if (
+                old_ledger_row.get(
+                    "filled_qty"
+                )
+                != ledger[
+                    order_key
+                ][
+                    "filled_qty"
+                ]
+            ):
+                self._record_lifecycle_event(
+                    position,
+                    "ACTUAL_CLOSE_FILL_UPDATED",
+                    "Broker close fill accounting was updated",
+                    details={
+                        "order_id": order_key,
+                        "filled_qty": ledger[
+                            order_key
+                        ][
+                            "filled_qty"
+                        ],
+                        "credit_per_share": ledger[
+                            order_key
+                        ][
+                            "credit_per_share"
+                        ],
+                        "source": ledger[
+                            order_key
+                        ][
+                            "source"
+                        ],
+                    },
+                )
+
+        entry_basis = self._lifecycle_float(
+            position.get(
+                "actual_entry_debit_per_share",
+                None,
+            ),
+            None,
+        )
+
+        ledger = position.get(
+            "broker_close_fill_ledger",
+            {},
+        ) or {}
+
+        total_close_qty = 0.0
+        realized_pnl = 0.0
+        weighted_close_credit = 0.0
+
+        if entry_basis is not None:
+            for fill in ledger.values():
+                qty = self._lifecycle_float(
+                    fill.get(
+                        "filled_qty",
+                        0.0,
+                    ),
+                    0.0,
+                ) or 0.0
+                credit = self._lifecycle_float(
+                    fill.get(
+                        "credit_per_share",
+                        None,
+                    ),
+                    None,
+                )
+
+                if (
+                    qty <= 0
+                    or credit is None
+                ):
+                    continue
+
+                total_close_qty += qty
+                weighted_close_credit += credit * qty
+                realized_pnl += (
+                    credit - entry_basis
+                ) * 100.0 * qty
+
+        position[
+            "actual_close_filled_qty"
+        ] = total_close_qty
+        position[
+            "actual_realized_pnl_dollars"
+        ] = realized_pnl
+
+        if total_close_qty > 0:
+            position[
+                "actual_close_avg_credit_per_share"
+            ] = (
+                weighted_close_credit
+                / total_close_qty
+            )
+        else:
+            position[
+                "actual_close_avg_credit_per_share"
+            ] = None
+
+
+    def log_broker_fill_accounting(
+        self,
+    ):
+        """Log persisted broker fill basis/realized P&L for option lifecycles."""
+
+        rows = []
+
+        for position in self._tracked_alert_positions.values():
+            if str(
+                position.get(
+                    "asset_type",
+                    "OPTION",
+                )
+                or "OPTION"
+            ).upper() != "OPTION":
+                continue
+
+            entry_basis = self._lifecycle_float(
+                position.get(
+                    "actual_entry_debit_per_share",
+                    None,
+                ),
+                None,
+            )
+
+            if entry_basis is None:
+                continue
+
+            rows.append(
+                {
+                    "underlying": position.get(
+                        "underlying",
+                        "",
+                    ),
+                    "status": self._normalize_lifecycle_status(
+                        position.get(
+                            "status",
+                            "ALERTED",
+                        )
+                    ),
+                    "entry_fill/share": round(
+                        entry_basis,
+                        4,
+                    ),
+                    "entry_fill_qty": round(
+                        self._lifecycle_float(
+                            position.get(
+                                "actual_entry_filled_qty",
+                                0.0,
+                            ),
+                            0.0,
+                        ) or 0.0,
+                        4,
+                    ),
+                    "entry_source": position.get(
+                        "actual_entry_basis_source",
+                        "",
+                    ),
+                    "open_qty": round(
+                        self._lifecycle_float(
+                            position.get(
+                                "broker_open_quantity",
+                                0.0,
+                            ),
+                            0.0,
+                        ) or 0.0,
+                        4,
+                    ),
+                    "close_fill/share": (
+                        None
+                        if position.get(
+                            "actual_close_avg_credit_per_share",
+                            None,
+                        ) is None
+                        else round(
+                            float(
+                                position[
+                                    "actual_close_avg_credit_per_share"
+                                ]
+                            ),
+                            4,
+                        )
+                    ),
+                    "close_fill_qty": round(
+                        self._lifecycle_float(
+                            position.get(
+                                "actual_close_filled_qty",
+                                0.0,
+                            ),
+                            0.0,
+                        ) or 0.0,
+                        4,
+                    ),
+                    "realized_pnl_$": round(
+                        self._lifecycle_float(
+                            position.get(
+                                "actual_realized_pnl_dollars",
+                                0.0,
+                            ),
+                            0.0,
+                        ) or 0.0,
+                        2,
+                    ),
+                }
+            )
+
+        if rows:
+            self.log_message(
+                "\n\n===== BROKER FILL ACCOUNTING =====\n"
+                + pd.DataFrame(
+                    rows
+                ).to_string(
+                    index=False
+                )
+                + "\n=================================="
+            )
 
 
     def _get_broker_lifecycle_snapshot(
@@ -10228,6 +12008,456 @@ class StockSuggestionStrategy(Strategy):
         return snapshot
 
 
+    def _lifecycle_position_claim_signature(
+        self,
+        position,
+    ):
+        """Stable signature for one intended option/stock position."""
+
+        legs = self._expected_lifecycle_legs(
+            position,
+            close=False,
+        )
+
+        return tuple(
+            sorted(
+                (
+                    str(leg.get("symbol", "") or "").upper(),
+                    str(leg.get("side", "") or "").lower(),
+                )
+                for leg in legs
+                if str(leg.get("symbol", "") or "")
+            )
+        )
+
+
+    def _broker_claim_owner_priority(
+        self,
+        position,
+        order=None,
+        prefix="entry",
+    ):
+        """Rank duplicate explicit broker claims deterministically.
+
+        Execution-created links outrank links learned heuristically. Exact
+        filled-quantity matches and timestamp proximity are secondary
+        tie-breakers. The purpose is not to infer a fill; it is only to
+        decide which lifecycle owns one already-linked broker order.
+        """
+
+        source = str(
+            position.get(
+                f"broker_{prefix}_link_source",
+                "",
+            )
+            or ""
+        ).upper()
+
+        execution_link = int(
+            bool(
+                position.get(
+                    "paper_execution_enabled_at_entry",
+                    False,
+                )
+            )
+            or source
+            in {
+                "SUBMIT_ORDER",
+                "EXISTING_CLIENT_ORDER_ID",
+            }
+        )
+
+        expected_quantity = float(
+            position.get(
+                "quantity",
+                position.get("approx_shares", 0.0),
+            )
+            or 0.0
+        )
+
+        quantity_match = 0
+        proximity_score = float("-inf")
+
+        if order is not None:
+            try:
+                filled_qty = float(
+                    order.get(
+                        "filled_qty",
+                        0.0,
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                filled_qty = 0.0
+
+            if (
+                expected_quantity > 0
+                and abs(filled_qty - expected_quantity)
+                <= max(
+                    1e-6,
+                    float(
+                        self.parameters.get(
+                            "lifecycle_quantity_tolerance",
+                            1e-6,
+                        )
+                    ),
+                )
+            ):
+                quantity_match = 1
+
+            entry_time = self._parse_lifecycle_datetime(
+                position.get(
+                    "entry_timestamp",
+                    None,
+                )
+            )
+            submitted_at = order.get(
+                "submitted_at"
+            )
+
+            if (
+                entry_time is not None
+                and submitted_at is not None
+            ):
+                try:
+                    proximity_score = -abs(
+                        (
+                            submitted_at.astimezone(timezone.utc)
+                            - entry_time.astimezone(timezone.utc)
+                        ).total_seconds()
+                    )
+                except Exception:
+                    proximity_score = float("-inf")
+
+        linked_at = self._parse_lifecycle_datetime(
+            position.get(
+                f"broker_{prefix}_linked_at",
+                None,
+            )
+        )
+
+        linked_at_score = (
+            linked_at.timestamp()
+            if linked_at is not None
+            else float("-inf")
+        )
+
+        status = self._normalize_lifecycle_status(
+            position.get(
+                "status",
+                "ALERTED",
+            )
+        )
+
+        status_rank = {
+            "ENTRY_WORKING": 4,
+            "PARTIALLY_OPEN": 3,
+            "OPEN": 3,
+            "CLOSE_ALERTED": 2,
+            "CLOSE_WORKING": 2,
+            "PARTIALLY_CLOSED": 2,
+            "ALERTED": 1,
+        }.get(status, 0)
+
+        return (
+            execution_link,
+            quantity_match,
+            status_rank,
+            proximity_score,
+            linked_at_score,
+            str(position.get("id", "") or ""),
+        )
+
+
+    def _build_lifecycle_broker_claim_ownership(
+        self,
+        snapshot,
+    ):
+        """Build exclusive broker order/position ownership metadata.
+
+        An explicitly linked broker order belongs to exactly one lifecycle.
+        Other lifecycle records may not adopt that order through same-leg/time
+        heuristics. This also detects and repairs duplicate links created by
+        older reconciliation logic.
+        """
+
+        claims = {
+            "entry": {
+                "order_id_owner": {},
+                "client_id_owner": {},
+            },
+            "close": {
+                "order_id_owner": {},
+                "client_id_owner": {},
+            },
+            "duplicate_entry_claims": {},
+            "entry_signature_owners": {},
+        }
+
+        normalized_orders = list(
+            snapshot.get(
+                "normalized_orders",
+                [],
+            )
+            or []
+        )
+
+        order_by_id = {
+            str(order.get("id", "") or ""): order
+            for order in normalized_orders
+            if str(order.get("id", "") or "")
+        }
+        order_by_client_id = {
+            str(order.get("client_order_id", "") or ""): order
+            for order in normalized_orders
+            if str(order.get("client_order_id", "") or "")
+        }
+
+        for prefix in ("entry", "close"):
+            groups = {}
+
+            for position_id, position in self._tracked_alert_positions.items():
+                asset_type = str(
+                    position.get("asset_type", "OPTION")
+                    or "OPTION"
+                ).upper()
+
+                if (
+                    asset_type == "FRACTIONAL_STOCK"
+                    and str(
+                        position.get("sizing_basis", "")
+                        or ""
+                    ).upper() == "SIMULATED_MICRO_EQUITY"
+                ):
+                    continue
+
+                linked_order_id = str(
+                    position.get(
+                        f"broker_{prefix}_order_id",
+                        "",
+                    )
+                    or ""
+                )
+                linked_client_id = str(
+                    position.get(
+                        f"broker_{prefix}_client_order_id",
+                        "",
+                    )
+                    or ""
+                )
+
+                if not (linked_order_id or linked_client_id):
+                    continue
+
+                order = (
+                    order_by_id.get(linked_order_id)
+                    if linked_order_id
+                    else None
+                )
+                if order is None and linked_client_id:
+                    order = order_by_client_id.get(
+                        linked_client_id
+                    )
+
+                canonical_order_id = str(
+                    (
+                        order.get("id", "")
+                        if order is not None
+                        else linked_order_id
+                    )
+                    or ""
+                )
+                canonical_client_id = str(
+                    (
+                        order.get("client_order_id", "")
+                        if order is not None
+                        else linked_client_id
+                    )
+                    or ""
+                )
+
+                if canonical_order_id:
+                    identity = ("ORDER", canonical_order_id)
+                else:
+                    identity = ("CLIENT", canonical_client_id)
+
+                groups.setdefault(
+                    identity,
+                    []
+                ).append(
+                    {
+                        "position_id": str(position_id),
+                        "position": position,
+                        "order": order,
+                        "order_id": canonical_order_id,
+                        "client_id": canonical_client_id,
+                    }
+                )
+
+            for identity, candidates in groups.items():
+                owner = max(
+                    candidates,
+                    key=lambda candidate: self._broker_claim_owner_priority(
+                        candidate["position"],
+                        order=candidate["order"],
+                        prefix=prefix,
+                    ),
+                )
+
+                owner_id = owner["position_id"]
+                order_id = owner["order_id"]
+                client_id = owner["client_id"]
+
+                if order_id:
+                    claims[prefix]["order_id_owner"][
+                        order_id
+                    ] = owner_id
+                if client_id:
+                    claims[prefix]["client_id_owner"][
+                        client_id
+                    ] = owner_id
+
+                if prefix == "entry":
+                    signature = self._lifecycle_position_claim_signature(
+                        owner["position"]
+                    )
+                    if signature:
+                        claims["entry_signature_owners"].setdefault(
+                            signature,
+                            set(),
+                        ).add(owner_id)
+
+                    for candidate in candidates:
+                        candidate_id = candidate["position_id"]
+                        if candidate_id == owner_id:
+                            continue
+
+                        claims["duplicate_entry_claims"][
+                            candidate_id
+                        ] = {
+                            "owner_position_id": owner_id,
+                            "order_id": order_id,
+                            "client_order_id": client_id,
+                            "identity": identity,
+                        }
+
+        return claims
+
+
+    def _supersede_duplicate_broker_claim(
+        self,
+        position,
+        duplicate_claim,
+    ):
+        """Terminalize a lifecycle that duplicated another broker link."""
+
+        prior_status = self._normalize_lifecycle_status(
+            position.get(
+                "status",
+                "ALERTED",
+            )
+        )
+
+        owner_position_id = str(
+            duplicate_claim.get(
+                "owner_position_id",
+                "",
+            )
+            or ""
+        )
+
+        archived_claim = {
+            "broker_entry_order_id": position.get(
+                "broker_entry_order_id",
+                "",
+            ),
+            "broker_entry_client_order_id": position.get(
+                "broker_entry_client_order_id",
+                "",
+            ),
+            "broker_entry_order_status": position.get(
+                "broker_entry_order_status",
+                "",
+            ),
+            "broker_entry_filled_qty": position.get(
+                "broker_entry_filled_qty",
+                0.0,
+            ),
+            "broker_entry_filled_avg_price": position.get(
+                "broker_entry_filled_avg_price",
+                None,
+            ),
+            "broker_open_quantity": position.get(
+                "broker_open_quantity",
+                0.0,
+            ),
+            "broker_peak_open_quantity": position.get(
+                "broker_peak_open_quantity",
+                0.0,
+            ),
+        }
+
+        position["superseded_broker_claim"] = archived_claim
+        position["superseded_by_lifecycle_id"] = owner_position_id
+        position["superseded_at"] = self.get_datetime().isoformat()
+
+        for field, reset_value in {
+            "broker_entry_order_id": "",
+            "broker_entry_client_order_id": "",
+            "broker_entry_order_status": "",
+            "broker_entry_filled_qty": 0.0,
+            "broker_entry_filled_avg_price": None,
+            "broker_open_quantity": 0.0,
+            "broker_peak_open_quantity": 0.0,
+            "broker_leg_signed_quantities": {},
+        }.items():
+            position[field] = reset_value
+
+        reason = (
+            "Broker entry order/position claim is owned by lifecycle "
+            f"{owner_position_id}; this duplicate heuristic claim was "
+            "superseded and no longer represents distinct exposure"
+        )
+
+        position["broker_reconciliation_state"] = (
+            "DUPLICATE_BROKER_CLAIM"
+        )
+        position["broker_reconciliation_note"] = reason
+        position["last_reconciliation_at"] = (
+            self.get_datetime().isoformat()
+        )
+
+        self._transition_trade_lifecycle(
+            position,
+            "SUPERSEDED",
+            reason,
+            details={
+                "owner_position_id": owner_position_id,
+                "broker_order_id": duplicate_claim.get(
+                    "order_id",
+                    "",
+                ),
+                "client_order_id": duplicate_claim.get(
+                    "client_order_id",
+                    "",
+                ),
+            },
+        )
+
+        return {
+            "position_id": position.get("id", ""),
+            "asset_type": position.get("asset_type", "OPTION"),
+            "underlying": position.get("underlying", ""),
+            "prior_status": prior_status,
+            "status": position.get("status", "SUPERSEDED"),
+            "broker_open_qty": 0.0,
+            "entry_order_status": "SUPERSEDED",
+            "close_order_status": "NONE",
+            "match_confidence": "DUPLICATE_BROKER_CLAIM",
+            "reason": reason,
+        }
+
+
     def _reconcile_single_trade_lifecycle(
         self,
         position,
@@ -10424,6 +12654,42 @@ class StockSuggestionStrategy(Strategy):
             )
         )
 
+        claim_ownership = snapshot.get(
+            "broker_claim_ownership",
+            {},
+        )
+
+        current_position_id = str(
+            position.get(
+                "id",
+                "",
+            )
+            or ""
+        )
+
+        position_claim_signature = (
+            self._lifecycle_position_claim_signature(
+                position
+            )
+        )
+
+        signature_owners = set(
+            claim_ownership.get(
+                "entry_signature_owners",
+                {},
+            ).get(
+                position_claim_signature,
+                set(),
+            )
+            or set()
+        )
+
+        position_claim_suppressed = (
+            bool(signature_owners)
+            and current_position_id
+            not in signature_owners
+        )
+
         asset_type = str(
             position.get(
                 "asset_type",
@@ -10473,12 +12739,18 @@ class StockSuggestionStrategy(Strategy):
                 "symbol"
             ]
 
-            actual = float(
+            raw_actual = float(
                 signed_qty.get(
                     symbol,
                     0.0,
                 )
                 or 0.0
+            )
+
+            actual = (
+                0.0
+                if position_claim_suppressed
+                else raw_actual
             )
 
             desired_sign = (
@@ -10511,7 +12783,7 @@ class StockSuggestionStrategy(Strategy):
 
             leg_quantities[
                 symbol
-            ] = actual
+            ] = raw_actual
 
             correct_quantities.append(
                 correct
@@ -10595,6 +12867,7 @@ class StockSuggestionStrategy(Strategy):
                         "normalized_orders"
                     ],
                     close=False,
+                    claim_owners=claim_ownership,
                 )
             )
 
@@ -10605,6 +12878,7 @@ class StockSuggestionStrategy(Strategy):
                         "normalized_orders"
                     ],
                     close=True,
+                    claim_owners=claim_ownership,
                 )
             )
 
@@ -10697,6 +12971,32 @@ class StockSuggestionStrategy(Strategy):
             close_evidence,
         )
 
+        entry_outcome = self._persist_order_outcome_metadata(
+            position,
+            "entry",
+            entry_evidence,
+            expected_quantity,
+            now,
+        )
+
+        close_outcome = self._persist_order_outcome_metadata(
+            position,
+            "close",
+            close_evidence,
+            max(
+                broker_peak,
+                expected_quantity,
+            ),
+            now,
+        )
+
+        self._update_lifecycle_fill_accounting(
+            position,
+            snapshot,
+            entry_evidence,
+            close_evidence,
+        )
+
         previously_open = (
             prior_peak > tolerance
             or prior_status
@@ -10723,17 +13023,59 @@ class StockSuggestionStrategy(Strategy):
 
         elif partial_leg_exposure:
 
-            new_status = (
-                "ORPHANED"
+            # A broken multi-leg ratio is not a healthy partial spread.
+            # Allow only a short order/position synchronization grace
+            # when broker fill evidence has just arrived; otherwise
+            # surface the unpaired exposure as ORPHANED for attention.
+            sync_prefix = (
+                "close"
                 if previously_open
-                else "PARTIALLY_OPEN"
+                else "entry"
+            )
+            sync_evidence = (
+                close_evidence
+                if previously_open
+                else entry_evidence
+            )
+            sync_outcome = (
+                close_outcome
+                if previously_open
+                else entry_outcome
             )
 
-            reason = (
-                "Only part of the expected multi-leg "
-                "broker position is present"
-            )
-            match_confidence = "POSITION_PARTIAL_LEGS"
+            if (
+                sync_outcome.get(
+                    "has_fill",
+                    False,
+                )
+                and self._order_position_sync_grace_active(
+                    position,
+                    sync_prefix,
+                    sync_evidence.get(
+                        "latest"
+                    ),
+                    now,
+                )
+            ):
+                new_status = (
+                    "CLOSE_WORKING"
+                    if previously_open
+                    else "ENTRY_WORKING"
+                )
+                reason = (
+                    "Only part of the expected multi-leg broker "
+                    "position is visible while broker fill activity "
+                    "is inside the position-sync grace period"
+                )
+                match_confidence = "ORDER_POSITION_SYNC_GRACE"
+            else:
+                new_status = "ORPHANED"
+                reason = (
+                    "Only part of the expected multi-leg broker "
+                    "position is present; broken-leg exposure is not "
+                    "treated as a valid partial spread"
+                )
+                match_confidence = "POSITION_PARTIAL_LEGS"
 
         elif broker_open_quantity > tolerance:
 
@@ -10743,35 +13085,68 @@ class StockSuggestionStrategy(Strategy):
                 else "POSITION_PARTIAL"
             )
 
-            close_working = (
-                close_evidence.get(
-                    "working"
+            close_working = bool(
+                close_outcome.get(
+                    "working",
+                    False,
                 )
-                is not None
             )
-
-            close_filled = (
-                close_evidence.get(
-                    "filled"
+            close_has_fill = bool(
+                close_outcome.get(
+                    "has_fill",
+                    False,
                 )
-                is not None
+            )
+            close_terminal = bool(
+                close_outcome.get(
+                    "terminal",
+                    False,
+                )
+            )
+            close_category = str(
+                close_outcome.get(
+                    "category",
+                    "NONE",
+                )
+                or "NONE"
             )
 
             if full_position_match:
 
                 if (
-                    close_filled
+                    close_has_fill
                     and previously_open
                 ):
 
-                    new_status = "ORPHANED"
-                    reason = (
-                        "Matching close order reports FILLED but "
-                        "the full broker position is still present"
+                    close_latest = close_evidence.get(
+                        "latest"
                     )
-                    match_confidence = (
-                        "ORDER_POSITION_CONFLICT"
-                    )
+
+                    if self._order_position_sync_grace_active(
+                        position,
+                        "close",
+                        close_latest,
+                        now,
+                    ):
+                        new_status = "CLOSE_WORKING"
+                        reason = (
+                            "Matching close order reports broker fill "
+                            "activity; awaiting broker position snapshot "
+                            "to reflect the reduction"
+                        )
+                        match_confidence = (
+                            "ORDER_POSITION_SYNC_GRACE"
+                        )
+                    else:
+                        new_status = "ORPHANED"
+                        reason = (
+                            "Matching close order reports fill activity "
+                            "but the full broker position remains present "
+                            "beyond the position-sync grace period"
+                        )
+                        match_confidence = (
+                            "ORDER_POSITION_CONFLICT"
+                        )
 
                 elif (
                     close_working
@@ -10783,6 +13158,31 @@ class StockSuggestionStrategy(Strategy):
                         "Broker position remains open and a "
                         "matching close order is working"
                     )
+
+                elif (
+                    close_terminal
+                    and previously_open
+                ):
+
+                    new_status = "CLOSE_ALERTED"
+                    retry_after = str(
+                        position.get(
+                            "paper_exit_retry_after_date",
+                            "",
+                        )
+                        or ""
+                    )
+                    reason = (
+                        "Matching close order reached terminal outcome "
+                        f"{close_category} while the broker position "
+                        "remains open; no same-day retry/chase is allowed"
+                        + (
+                            f"; retry eligible on/after {retry_after}"
+                            if retry_after
+                            else ""
+                        )
+                    )
+                    match_confidence = "ORDER_TERMINAL_POSITION_OPEN"
 
                 elif (
                     prior_status
@@ -10808,16 +13208,70 @@ class StockSuggestionStrategy(Strategy):
 
                 if previously_open:
                     new_status = "PARTIALLY_CLOSED"
-                    reason = (
-                        "Broker position quantity is below the "
-                        "previously open quantity"
-                    )
+
+                    if close_working:
+                        reason = (
+                            "Broker position is partially closed and "
+                            "the close order remains working for the "
+                            "remaining quantity"
+                        )
+                    elif close_terminal:
+                        retry_after = str(
+                            position.get(
+                                "paper_exit_retry_after_date",
+                                "",
+                            )
+                            or ""
+                        )
+                        reason = (
+                            "Broker position is partially closed; the "
+                            f"remaining close order is {close_category} "
+                            "and the residual position remains managed "
+                            "without same-day chasing"
+                            + (
+                                f"; retry eligible on/after {retry_after}"
+                                if retry_after
+                                else ""
+                            )
+                        )
+                    else:
+                        reason = (
+                            "Broker position quantity is below the "
+                            "previously open quantity"
+                        )
                 else:
                     new_status = "PARTIALLY_OPEN"
-                    reason = (
-                        "Broker position is present below the "
-                        "expected alert quantity"
-                    )
+
+                    if (
+                        entry_outcome.get(
+                            "has_fill",
+                            False,
+                        )
+                        and entry_outcome.get(
+                            "terminal",
+                            False,
+                        )
+                    ):
+                        reason = (
+                            "Entry order partially filled and its "
+                            f"unfilled remainder is {entry_outcome.get('category', 'TERMINAL')}; "
+                            "the smaller broker position is retained and "
+                            "will not be topped up automatically"
+                        )
+                    elif entry_outcome.get(
+                        "working",
+                        False,
+                    ):
+                        reason = (
+                            "Entry order is partially filled; broker "
+                            "position is below target quantity and the "
+                            "remaining order is still working"
+                        )
+                    else:
+                        reason = (
+                            "Broker position is present below the "
+                            "expected alert quantity"
+                        )
 
         elif any_expected_symbol_position:
 
@@ -10871,23 +13325,40 @@ class StockSuggestionStrategy(Strategy):
                 )
                 match_confidence = "ORDER_ROUND_TRIP"
 
-            elif entry_filled is not None:
+            elif entry_outcome.get(
+                "has_fill",
+                False,
+            ):
 
-                new_status = "ORPHANED"
-                reason = (
-                    "Matching entry order reports FILLED but no "
-                    "current broker position is present"
+                entry_latest = entry_evidence.get(
+                    "latest"
                 )
-                match_confidence = "ORDER_POSITION_CONFLICT"
 
-            elif entry_partial is not None:
-
-                new_status = "ORPHANED"
-                reason = (
-                    "Matching entry order reports a partial fill "
-                    "but no current broker position is present"
-                )
-                match_confidence = "ORDER_POSITION_CONFLICT"
+                if self._order_position_sync_grace_active(
+                    position,
+                    "entry",
+                    entry_latest,
+                    now,
+                ):
+                    new_status = "ENTRY_WORKING"
+                    reason = (
+                        "Matching entry order reports fill activity; "
+                        "awaiting broker position snapshot to reflect "
+                        "the new exposure"
+                    )
+                    match_confidence = (
+                        "ORDER_POSITION_SYNC_GRACE"
+                    )
+                else:
+                    new_status = "ORPHANED"
+                    reason = (
+                        "Matching entry order reports fill activity but "
+                        "no current broker position is present beyond "
+                        "the position-sync grace period"
+                    )
+                    match_confidence = (
+                        "ORDER_POSITION_CONFLICT"
+                    )
 
             elif entry_working is not None:
 
@@ -10899,39 +13370,46 @@ class StockSuggestionStrategy(Strategy):
 
             elif entry_terminal is not None:
 
-                status = str(
-                    entry_terminal.get(
-                        "status",
-                        "",
+                category = str(
+                    entry_outcome.get(
+                        "category",
+                        "UNKNOWN",
                     )
-                    or ""
-                ).lower()
-
-                filled_qty = float(
-                    entry_terminal.get(
-                        "filled_qty",
-                        0.0,
-                    )
-                    or 0.0
+                    or "UNKNOWN"
                 )
 
-                if filled_qty <= tolerance:
+                if category == "REJECTED":
+                    new_status = "REJECTED"
+                elif category == "EXPIRED":
+                    new_status = "EXPIRED"
+                elif category == "CANCELED":
+                    new_status = "CANCELED"
+                else:
+                    new_status = "ORPHANED"
 
-                    if status == "rejected":
-                        new_status = "REJECTED"
-                    elif status == "expired":
-                        new_status = "EXPIRED"
-                    else:
-                        new_status = "CANCELED"
+                reason = (
+                    "Matching broker entry order reached terminal "
+                    f"outcome {category} without a broker position"
+                )
+                match_confidence = (
+                    "ORDER_ONLY"
+                    if new_status in {
+                        "REJECTED",
+                        "EXPIRED",
+                        "CANCELED",
+                    }
+                    else "ORDER_TERMINAL_UNEXPECTED"
+                )
 
-                    reason = (
-                        "Matching broker entry order reached "
-                        f"terminal status {status or 'unknown'} "
-                        "without a fill"
-                    )
-                    match_confidence = "ORDER_ONLY"
-
-            if new_status == prior_status:
+            if (
+                new_status == prior_status
+                and entry_evidence.get(
+                    "latest"
+                ) is None
+                and close_evidence.get(
+                    "latest"
+                ) is None
+            ):
 
                 expiration_text = str(
                     position.get(
@@ -11040,11 +13518,26 @@ class StockSuggestionStrategy(Strategy):
                     else:
 
                         new_status = "ALERTED"
-                        reason = (
-                            "No broker position/order match yet; "
-                            "alert remains inside reconciliation "
-                            "grace or order evidence is incomplete"
-                        )
+
+                        if position_claim_suppressed:
+                            owners_text = ", ".join(
+                                sorted(signature_owners)
+                            )
+                            reason = (
+                                "Matching broker position/order is "
+                                "exclusively claimed by linked lifecycle "
+                                f"{owners_text}; this lifecycle remains "
+                                "unmatched"
+                            )
+                            match_confidence = (
+                                "CLAIMED_BY_OTHER_LIFECYCLE"
+                            )
+                        else:
+                            reason = (
+                                "No broker position/order match yet; "
+                                "alert remains inside reconciliation "
+                                "grace or order evidence is incomplete"
+                            )
 
         position[
             "broker_reconciliation_state"
@@ -11091,6 +13584,18 @@ class StockSuggestionStrategy(Strategy):
                         close_evidence
                     )
                 ),
+                "entry_order_outcome": entry_outcome.get(
+                    "category",
+                    "NONE",
+                ),
+                "close_order_outcome": close_outcome.get(
+                    "category",
+                    "NONE",
+                ),
+                "paper_exit_retry_after_date": position.get(
+                    "paper_exit_retry_after_date",
+                    "",
+                ),
                 "match_confidence": (
                     match_confidence
                 ),
@@ -11123,6 +13628,18 @@ class StockSuggestionStrategy(Strategy):
                 evidence_status(
                     close_evidence
                 )
+            ),
+            "entry_order_outcome": entry_outcome.get(
+                "category",
+                "NONE",
+            ),
+            "close_order_outcome": close_outcome.get(
+                "category",
+                "NONE",
+            ),
+            "exit_retry_after": position.get(
+                "paper_exit_retry_after_date",
+                "",
             ),
             "match_confidence": (
                 match_confidence
@@ -11158,6 +13675,12 @@ class StockSuggestionStrategy(Strategy):
             self._get_broker_lifecycle_snapshot()
         )
 
+        snapshot[
+            "broker_claim_ownership"
+        ] = self._build_lifecycle_broker_claim_ownership(
+            snapshot
+        )
+
         rows = []
 
         changed = False
@@ -11175,12 +13698,32 @@ class StockSuggestionStrategy(Strategy):
                 )
             )
 
-            row = (
-                self._reconcile_single_trade_lifecycle(
-                    position,
-                    snapshot,
+            duplicate_claim = (
+                snapshot.get(
+                    "broker_claim_ownership",
+                    {},
+                )
+                .get(
+                    "duplicate_entry_claims",
+                    {},
+                )
+                .get(
+                    str(position_id)
                 )
             )
+
+            if duplicate_claim:
+                row = self._supersede_duplicate_broker_claim(
+                    position,
+                    duplicate_claim,
+                )
+            else:
+                row = (
+                    self._reconcile_single_trade_lifecycle(
+                        position,
+                        snapshot,
+                    )
+                )
 
             broker_evidence_complete = (
                 bool(
@@ -13392,6 +15935,1216 @@ class StockSuggestionStrategy(Strategy):
 
 
     # ======================================================
+    # PRODUCTION SAFETY / HARDENING
+    # ======================================================
+
+    @staticmethod
+    def _env_bool(name, default=False):
+        raw = os.environ.get(name, None)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _env_float(name, default):
+        raw = os.environ.get(name, None)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _env_int(name, default):
+        raw = os.environ.get(name, None)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _validate_trade_state_payload(self, state):
+        if not isinstance(state, dict):
+            raise ValueError("lifecycle state root must be a JSON object")
+        positions = state.get("positions", None)
+        if not isinstance(positions, list):
+            raise ValueError("lifecycle state positions must be a list")
+        seen = set()
+        for index, position in enumerate(positions):
+            if not isinstance(position, dict):
+                raise ValueError(f"lifecycle record {index} is not an object")
+            lifecycle_id = str(position.get("id", "") or "").strip()
+            if not lifecycle_id:
+                raise ValueError(f"lifecycle record {index} has no id")
+            if lifecycle_id in seen:
+                raise ValueError(f"duplicate lifecycle id: {lifecycle_id}")
+            seen.add(lifecycle_id)
+        return state
+
+    def _read_valid_trade_state_file(self, path):
+        with open(path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        return self._validate_trade_state_payload(state)
+
+    def _trade_state_backup_candidates(self):
+        directory = str(getattr(self, "trade_state_backup_dir", "") or "")
+        if not directory or not os.path.isdir(directory):
+            return []
+        candidates = []
+        for name in os.listdir(directory):
+            if not name.startswith("trade-state-") or not name.endswith(".json"):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            candidates.append((mtime, path))
+        candidates.sort(reverse=True)
+        return [path for _, path in candidates]
+
+    def _prune_trade_state_backups(self):
+        max_files = max(3, int(getattr(self, "trade_state_backup_max_files", 25)))
+        for path in self._trade_state_backup_candidates()[max_files:]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _backup_current_trade_state(self, force=False):
+        if not bool(getattr(self, "trade_state_backup_enabled", True)):
+            return None
+        path = str(getattr(self, "trade_alert_positions_path", "") or "")
+        directory = str(getattr(self, "trade_state_backup_dir", "") or "")
+        if not path or not directory or not os.path.exists(path):
+            return None
+
+        now = datetime.now(timezone.utc)
+        last = getattr(self, "_last_trade_state_backup_at", None)
+        minimum = float(
+            getattr(self, "trade_state_backup_min_interval_seconds", 60.0) or 0.0
+        )
+        if (
+            not force
+            and isinstance(last, datetime)
+            and (now - last).total_seconds() < minimum
+        ):
+            return None
+
+        try:
+            self._read_valid_trade_state_file(path)
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except Exception:
+            return None
+
+        digest = hashlib.sha256(raw).hexdigest()[:12]
+        os.makedirs(directory, exist_ok=True)
+        stamp = now.strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = os.path.join(
+            directory,
+            f"trade-state-{stamp}-{digest}.json",
+        )
+        temporary = backup_path + ".tmp"
+        shutil.copy2(path, temporary)
+        self._read_valid_trade_state_file(temporary)
+        os.replace(temporary, backup_path)
+        self._last_trade_state_backup_at = now
+        self._prune_trade_state_backups()
+        return backup_path
+
+    def _quarantine_corrupt_trade_state(self, path):
+        if not path or not os.path.exists(path):
+            return ""
+        directory = str(getattr(self, "trade_state_backup_dir", "") or "")
+        if not directory:
+            return ""
+        try:
+            os.makedirs(directory, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            target = os.path.join(directory, f"CORRUPT-{stamp}.json")
+            shutil.copy2(path, target)
+            return target
+        except Exception:
+            return ""
+
+    def _load_trade_state_with_recovery(self, path):
+        if not path or not os.path.exists(path):
+            self._lifecycle_state_integrity_ok = True
+            return None
+
+        try:
+            state = self._read_valid_trade_state_file(path)
+            self._lifecycle_state_integrity_ok = True
+            return state
+        except Exception as primary_exc:
+            self._lifecycle_state_integrity_ok = False
+            quarantined = self._quarantine_corrupt_trade_state(path)
+            for backup_path in self._trade_state_backup_candidates():
+                try:
+                    state = self._read_valid_trade_state_file(backup_path)
+                    temporary = path + ".recovery.tmp"
+                    shutil.copy2(backup_path, temporary)
+                    self._read_valid_trade_state_file(temporary)
+                    os.replace(temporary, path)
+                    self._lifecycle_state_integrity_ok = True
+                    self._lifecycle_state_recovered_from_backup = True
+                    self._lifecycle_state_recovery_reason = (
+                        f"primary invalid ({primary_exc}); restored {backup_path}"
+                    )
+                    message = (
+                        "Corrupt lifecycle primary was restored from valid backup "
+                        f"{backup_path}."
+                        + (
+                            f" Corrupt copy preserved at {quarantined}."
+                            if quarantined
+                            else ""
+                        )
+                    )
+                    self.log_message("STATE RECOVERY: " + message)
+                    self._record_trading_anomaly(
+                        "STATE_RECOVERY",
+                        "WARNING",
+                        message,
+                        context={"backup_path": backup_path, "quarantined_path": quarantined},
+                    )
+                    return state
+                except Exception:
+                    continue
+
+            self._lifecycle_state_recovery_reason = (
+                "primary lifecycle state invalid and no valid backup exists: "
+                f"{primary_exc}"
+            )
+            message = (
+                "CRITICAL STATE RECOVERY FAILURE: lifecycle state is corrupt and "
+                "no valid backup is available. NEW entries are forbidden."
+            )
+            self.log_message(message)
+            self._record_trading_anomaly(
+                "STATE_RECOVERY_FAILURE",
+                "CRITICAL",
+                message,
+                context={"reason": self._lifecycle_state_recovery_reason},
+            )
+            if bool(getattr(self, "trade_state_fail_fast_on_unrecoverable", True)):
+                raise RuntimeError(message) from primary_exc
+            return None
+
+    def _path_writable_health(self, path, label, directory_only=False):
+        if not path:
+            return {
+                "check": label,
+                "status": "WARN",
+                "detail": "path disabled/unset",
+            }
+        try:
+            directory = (
+                path
+                if directory_only
+                else os.path.dirname(os.path.abspath(path))
+            )
+            if not directory:
+                directory = os.getcwd()
+            os.makedirs(directory, exist_ok=True)
+            probe = os.path.join(
+                directory,
+                f".healthcheck-{os.getpid()}-{label.replace(' ', '_')}.tmp",
+            )
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.remove(probe)
+            return {"check": label, "status": "PASS", "detail": directory}
+        except Exception as exc:
+            return {"check": label, "status": "FAIL", "detail": str(exc)}
+
+    def _run_startup_health_check(self):
+        results = []
+        market_clock_timestamp = None
+
+        lifecycle_ok = bool(
+            getattr(self, "_lifecycle_state_integrity_ok", False)
+        )
+        lifecycle_detail = (
+            "valid"
+            + (
+                "; recovered from backup"
+                if getattr(self, "_lifecycle_state_recovered_from_backup", False)
+                else ""
+            )
+            if lifecycle_ok
+            else str(getattr(self, "_lifecycle_state_recovery_reason", "invalid"))
+        )
+        results.append(
+            {
+                "check": "lifecycle_state_integrity",
+                "status": "PASS" if lifecycle_ok else "FAIL",
+                "detail": lifecycle_detail,
+            }
+        )
+
+        try:
+            account = self.alpaca_trading_client.get_account()
+            blocked_fields = [
+                name
+                for name in (
+                    "trading_blocked",
+                    "account_blocked",
+                    "trade_suspended_by_user",
+                )
+                if bool(getattr(account, name, False))
+            ]
+            if blocked_fields:
+                results.append(
+                    {
+                        "check": "alpaca_account",
+                        "status": "FAIL",
+                        "detail": "blocked flags: " + ",".join(blocked_fields),
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "check": "alpaca_account",
+                        "status": "PASS",
+                        "detail": f"equity={getattr(account, 'equity', None)}",
+                    }
+                )
+        except Exception as exc:
+            results.append(
+                {"check": "alpaca_account", "status": "FAIL", "detail": str(exc)}
+            )
+
+        try:
+            clock = self.alpaca_trading_client.get_clock()
+            timestamp = getattr(clock, "timestamp", None)
+            if timestamp is None:
+                raise ValueError("market clock returned no timestamp")
+            market_clock_timestamp = timestamp
+            results.append(
+                {
+                    "check": "alpaca_market_clock",
+                    "status": "PASS",
+                    "detail": str(timestamp),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "check": "alpaca_market_clock",
+                    "status": "FAIL",
+                    "detail": str(exc),
+                }
+            )
+
+        try:
+            broker_snapshot = self._get_broker_lifecycle_snapshot()
+            status = (
+                "PASS"
+                if (
+                    broker_snapshot.get("positions_available")
+                    and broker_snapshot.get("orders_available")
+                )
+                else "FAIL"
+            )
+            detail = (
+                f"positions={len(broker_snapshot.get('positions', []))}; "
+                f"orders={len(broker_snapshot.get('orders', []))}; "
+                f"truncated={bool(broker_snapshot.get('orders_truncated'))}"
+            )
+            if broker_snapshot.get("positions_error"):
+                detail += f"; positions_error={broker_snapshot['positions_error']}"
+            if broker_snapshot.get("orders_error"):
+                detail += f"; orders_error={broker_snapshot['orders_error']}"
+            results.append(
+                {
+                    "check": "broker_positions_orders",
+                    "status": status,
+                    "detail": detail,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "check": "broker_positions_orders",
+                    "status": "FAIL",
+                    "detail": str(exc),
+                }
+            )
+
+        if self.paper_execution_armed or self.paper_exit_execution_armed:
+            results.append(
+                {
+                    "check": "paper_execution_safety",
+                    "status": "PASS" if self.alpaca_is_paper else "FAIL",
+                    "detail": (
+                        "ALPACA_IS_PAPER=true"
+                        if self.alpaca_is_paper
+                        else "execution arm active on non-paper account"
+                    ),
+                }
+            )
+            try:
+                level = int(self.options_trading_level)
+            except (TypeError, ValueError):
+                level = None
+            results.append(
+                {
+                    "check": "options_trading_level",
+                    "status": "PASS" if level is not None and level >= 2 else "FAIL",
+                    "detail": str(level),
+                }
+            )
+
+        circuit_state_ok = bool(
+            getattr(self, "_circuit_breaker_state_integrity_ok", True)
+        )
+        results.append(
+            {
+                "check": "circuit_breaker_state_integrity",
+                "status": "PASS" if circuit_state_ok else "FAIL",
+                "detail": (
+                    "valid"
+                    if circuit_state_ok
+                    else str(
+                        getattr(
+                            self,
+                            "_circuit_breaker_state_integrity_reason",
+                            "invalid",
+                        )
+                    )
+                ),
+            }
+        )
+
+        results.append(
+            self._path_writable_health(
+                self.trade_alert_positions_path,
+                "lifecycle_state_path",
+            )
+        )
+        if self.trade_state_backup_enabled:
+            results.append(
+                self._path_writable_health(
+                    self.trade_state_backup_dir,
+                    "lifecycle_backup_dir",
+                    directory_only=True,
+                )
+            )
+        results.append(
+            self._path_writable_health(
+                self.trading_circuit_breaker_state_path,
+                "circuit_breaker_state_path",
+            )
+        )
+        if bool(self.parameters.get("trade_journal_enabled", True)):
+            if self.trade_journal_csv_path:
+                results.append(
+                    self._path_writable_health(
+                        self.trade_journal_csv_path,
+                        "trade_journal_path",
+                    )
+                )
+            if self.trade_analytics_json_path:
+                results.append(
+                    self._path_writable_health(
+                        self.trade_analytics_json_path,
+                        "trade_analytics_path",
+                    )
+                )
+        if bool(self.parameters.get("daily_operational_summary_enabled", True)):
+            results.append(
+                self._path_writable_health(
+                    self.daily_trading_summary_path,
+                    "daily_trading_summary_path",
+                )
+            )
+        if bool(self.parameters.get("trading_anomaly_log_enabled", True)):
+            results.append(
+                self._path_writable_health(
+                    self.trading_anomalies_jsonl_path,
+                    "trading_anomalies_path",
+                )
+            )
+
+        provider = str(
+            getattr(self, "earnings_calendar_provider", "") or ""
+        ).upper()
+        manual_path = str(getattr(self, "earnings_calendar_path", "") or "")
+        if manual_path:
+            earnings_status = "PASS" if os.path.exists(manual_path) else "WARN"
+            earnings_detail = f"manual={manual_path}"
+        elif provider == "ALPHAVANTAGE":
+            earnings_status = (
+                "PASS" if bool(getattr(self, "alphavantage_api_key", "")) else "WARN"
+            )
+            earnings_detail = (
+                "Alpha Vantage key configured"
+                if earnings_status == "PASS"
+                else "Alpha Vantage key missing; event-risk layer will fail closed"
+            )
+        else:
+            earnings_status = "WARN"
+            earnings_detail = f"provider={provider or 'NONE'}"
+        results.append(
+            {
+                "check": "earnings_event_risk_config",
+                "status": earnings_status,
+                "detail": earnings_detail,
+            }
+        )
+
+        kill_active, kill_env, kill_file = self._kill_switch_active()
+        results.append(
+            {
+                "check": "emergency_kill_switch",
+                "status": "BLOCK" if kill_active else "PASS",
+                "detail": (
+                    "active via "
+                    + ",".join(
+                        source
+                        for source, active in (("env", kill_env), ("file", kill_file))
+                        if active
+                    )
+                    if kill_active
+                    else "inactive"
+                ),
+            }
+        )
+
+        failures = [row for row in results if row.get("status") == "FAIL"]
+        self._startup_health_results = results
+        self.startup_health_entries_allowed = not failures
+
+        # Evaluate current breaker state before printing the startup gate so the
+        # operator sees the same decision that entry execution will enforce.
+        circuit_state = self.refresh_trading_circuit_breakers(
+            market_now=market_clock_timestamp,
+            log_status=False,
+        )
+        gate_allowed, gate_reasons = self._new_entry_execution_safety_gate()
+
+        report = {
+            "generated_at": self.get_datetime().isoformat(),
+            "startup_health_passed": bool(self.startup_health_entries_allowed),
+            "new_entries_allowed": bool(gate_allowed),
+            "new_entry_block_reasons": list(gate_reasons),
+            "circuit_breaker": circuit_state,
+            "results": results,
+        }
+        if self.startup_health_report_path:
+            try:
+                self._atomic_write_json(report, self.startup_health_report_path)
+            except Exception as exc:
+                results.append(
+                    {
+                        "check": "startup_health_report",
+                        "status": "WARN",
+                        "detail": str(exc),
+                    }
+                )
+
+        for row in failures:
+            self._record_trading_anomaly(
+                "STARTUP_HEALTH_FAILURE",
+                "ERROR",
+                f"{row.get('check')}: {row.get('detail')}",
+                context=row,
+            )
+        if kill_active:
+            self._record_trading_anomaly(
+                "EMERGENCY_KILL_SWITCH_ACTIVE",
+                "INFO",
+                "Emergency kill switch is active; new entries are blocked while exits remain enabled.",
+                context={"env": bool(kill_env), "file": bool(kill_file)},
+            )
+
+        self.log_message(
+            "\n\n===== STARTUP HEALTH CHECK =====\n"
+            + pd.DataFrame(results)[["check", "status", "detail"]].to_string(
+                index=False
+            )
+            + "\n================================\n"
+            + (
+                "NEW ENTRY GATE: ALLOWED"
+                if gate_allowed
+                else (
+                    "NEW ENTRY GATE: BLOCKED; existing positions/exits remain managed; "
+                    "reasons=" + ",".join(gate_reasons)
+                )
+            )
+        )
+        self.refresh_daily_operational_summary()
+        return report
+
+    def _load_recent_anomaly_keys(self):
+        self._anomaly_emitted_keys = set()
+        path = str(getattr(self, "trading_anomalies_jsonl_path", "") or "")
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()[-2000:]
+            for line in lines:
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                key = str(payload.get("anomaly_key", "") or "")
+                if key:
+                    self._anomaly_emitted_keys.add(key)
+        except Exception:
+            # Anomaly reporting must never block trading/lifecycle management.
+            return
+
+    def _record_trading_anomaly(
+        self,
+        code,
+        severity,
+        message,
+        lifecycle_id="",
+        underlying="",
+        context=None,
+    ):
+        if not bool(self.parameters.get("trading_anomaly_log_enabled", True)):
+            return False
+        path = str(getattr(self, "trading_anomalies_jsonl_path", "") or "")
+        if not path:
+            return False
+
+        now = self.get_datetime()
+        date_key = now.date().isoformat() if isinstance(now, datetime) else str(date.today())
+        stable = "|".join(
+            [
+                date_key,
+                str(code or "UNKNOWN"),
+                str(lifecycle_id or ""),
+                str(underlying or ""),
+                str(message or ""),
+            ]
+        )
+        anomaly_key = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:24]
+        if anomaly_key in getattr(self, "_anomaly_emitted_keys", set()):
+            return False
+
+        payload = {
+            "anomaly_key": anomaly_key,
+            "timestamp": now.isoformat() if isinstance(now, datetime) else datetime.now(timezone.utc).isoformat(),
+            "trading_date": date_key,
+            "severity": str(severity or "WARNING").upper(),
+            "code": str(code or "UNKNOWN").upper(),
+            "message": str(message or ""),
+            "lifecycle_id": str(lifecycle_id or ""),
+            "underlying": str(underlying or ""),
+            "context": context if isinstance(context, dict) else {},
+        }
+        try:
+            directory = os.path.dirname(os.path.abspath(path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._anomaly_emitted_keys.add(anomaly_key)
+            self.log_message(
+                "TRADING ANOMALY: "
+                f"{payload['severity']} {payload['code']}"
+                + (f" {payload['underlying']}" if payload["underlying"] else "")
+                + f" | {payload['message']}"
+            )
+            return True
+        except Exception as exc:
+            self.log_message(f"Could not persist trading anomaly log: {exc}")
+            return False
+
+    def _scan_and_record_trading_anomalies(self, lifecycle_snapshot=None):
+        snapshot = lifecycle_snapshot if isinstance(lifecycle_snapshot, dict) else {}
+        if snapshot:
+            if not snapshot.get("positions_available", True):
+                self._record_trading_anomaly(
+                    "BROKER_POSITIONS_UNAVAILABLE",
+                    "ERROR",
+                    "Broker position snapshot is unavailable; reconciliation fails closed.",
+                    context={"error": snapshot.get("positions_error", "")},
+                )
+            if not snapshot.get("orders_available", True):
+                self._record_trading_anomaly(
+                    "BROKER_ORDERS_UNAVAILABLE",
+                    "ERROR",
+                    "Broker order snapshot is unavailable; reconciliation fails closed.",
+                    context={"error": snapshot.get("orders_error", "")},
+                )
+            if snapshot.get("orders_truncated"):
+                self._record_trading_anomaly(
+                    "BROKER_ORDER_HISTORY_TRUNCATED",
+                    "WARNING",
+                    "Broker order history hit the configured reconciliation limit.",
+                    context={"order_count": len(snapshot.get("orders", []))},
+                )
+
+        terminal_order_alerts = {"REJECTED", "CANCELED", "EXPIRED", "DONE_FOR_DAY"}
+        for lifecycle_id, position in self._tracked_alert_positions.items():
+            if not isinstance(position, dict):
+                continue
+            underlying = str(position.get("underlying", "") or "")
+            status = self._normalize_lifecycle_status(position.get("status", ""))
+            if status == "ORPHANED":
+                self._record_trading_anomaly(
+                    "ORPHANED_LIFECYCLE",
+                    "CRITICAL",
+                    str(position.get("status_reason", "") or "Lifecycle is ORPHANED."),
+                    lifecycle_id=lifecycle_id,
+                    underlying=underlying,
+                )
+
+            entry_status = str(position.get("broker_entry_order_status", "") or "").upper()
+            if entry_status in terminal_order_alerts:
+                self._record_trading_anomaly(
+                    "ENTRY_ORDER_TERMINAL",
+                    "WARNING",
+                    f"Entry order reached terminal status {entry_status}.",
+                    lifecycle_id=lifecycle_id,
+                    underlying=underlying,
+                    context={"broker_order_id": position.get("broker_entry_order_id", "")},
+                )
+
+            close_status = str(position.get("broker_close_order_status", "") or "").upper()
+            open_qty = self._lifecycle_float(position.get("broker_open_quantity", 0.0), 0.0) or 0.0
+            if close_status in terminal_order_alerts and open_qty > 0:
+                self._record_trading_anomaly(
+                    "EXIT_ORDER_TERMINAL_WITH_REMAINDER",
+                    "WARNING",
+                    f"Exit order reached terminal status {close_status} with {open_qty:g} contract(s) still open.",
+                    lifecycle_id=lifecycle_id,
+                    underlying=underlying,
+                    context={
+                        "broker_order_id": position.get("broker_close_order_id", ""),
+                        "retry_after_date": position.get("paper_exit_retry_after_date", ""),
+                    },
+                )
+
+            if position.get("paper_execution_last_error"):
+                self._record_trading_anomaly(
+                    "ENTRY_EXECUTION_ERROR",
+                    "ERROR",
+                    str(position.get("paper_execution_last_error")),
+                    lifecycle_id=lifecycle_id,
+                    underlying=underlying,
+                )
+            if position.get("paper_exit_execution_last_error"):
+                self._record_trading_anomaly(
+                    "EXIT_EXECUTION_ERROR",
+                    "ERROR",
+                    str(position.get("paper_exit_execution_last_error")),
+                    lifecycle_id=lifecycle_id,
+                    underlying=underlying,
+                )
+
+    def _anomaly_counts_for_date(self, trade_date):
+        counts = {"total": 0, "CRITICAL": 0, "ERROR": 0, "WARNING": 0, "INFO": 0}
+        path = str(getattr(self, "trading_anomalies_jsonl_path", "") or "")
+        if not path or not os.path.exists(path):
+            return counts
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(row.get("trading_date", "")) != trade_date.isoformat():
+                        continue
+                    severity = str(row.get("severity", "INFO") or "INFO").upper()
+                    counts["total"] += 1
+                    counts[severity] = counts.get(severity, 0) + 1
+        except Exception:
+            return counts
+        return counts
+
+    def refresh_daily_operational_summary(
+        self,
+        session_status=None,
+        lifecycle_snapshot=None,
+        analytics=None,
+    ):
+        if not bool(self.parameters.get("daily_operational_summary_enabled", True)):
+            return None
+        path = str(getattr(self, "daily_trading_summary_path", "") or "")
+        if not path:
+            return None
+
+        now = self.get_datetime()
+        session = session_status if isinstance(session_status, dict) else {}
+        market_now = session.get("now") if session else None
+        trade_date = self._current_trading_date(market_now)
+
+        try:
+            account = self._get_account_risk_snapshot()
+        except Exception as exc:
+            account = {"error": str(exc)}
+            self._record_trading_anomaly(
+                "DAILY_SUMMARY_ACCOUNT_UNAVAILABLE",
+                "ERROR",
+                f"Operational summary could not read account snapshot: {exc}",
+            )
+
+        if analytics is None:
+            try:
+                analytics = self._build_trade_analytics(pd.DataFrame(self._trade_journal_rows()))
+            except Exception as exc:
+                analytics = {"error": str(exc)}
+
+        statuses = {}
+        open_positions = []
+        for lifecycle_id, position in self._tracked_alert_positions.items():
+            if not isinstance(position, dict):
+                continue
+            status = self._normalize_lifecycle_status(position.get("status", "UNKNOWN"))
+            statuses[status] = statuses.get(status, 0) + 1
+            open_qty = self._lifecycle_float(position.get("broker_open_quantity", 0.0), 0.0) or 0.0
+            if open_qty > 0:
+                open_positions.append(
+                    {
+                        "lifecycle_id": lifecycle_id,
+                        "underlying": str(position.get("underlying", "") or ""),
+                        "decision": str(position.get("decision", "") or ""),
+                        "status": status,
+                        "open_qty": open_qty,
+                        "actual_entry_fill_per_share": self._trade_journal_json_number(
+                            position.get("actual_entry_debit_per_share")
+                        ),
+                        "realized_pnl_dollars": self._trade_journal_json_number(
+                            position.get("realized_pnl_dollars", 0.0)
+                        ),
+                    }
+                )
+
+        gate_allowed, gate_reasons = self._new_entry_execution_safety_gate()
+        circuit_state = dict(getattr(self, "_trading_circuit_breaker_state", {}) or {})
+        snapshot = lifecycle_snapshot if isinstance(lifecycle_snapshot, dict) else {}
+        anomaly_counts = self._anomaly_counts_for_date(trade_date)
+
+        summary = {
+            "generated_at": now.isoformat() if isinstance(now, datetime) else str(now),
+            "trading_date": trade_date.isoformat(),
+            "market": {
+                "allowed": session.get("allowed") if session else None,
+                "now": str(session.get("now")) if session.get("now") is not None else None,
+                "reason": str(session.get("reason", "") or ""),
+                "actionable_open": str(session.get("actionable_open")) if session.get("actionable_open") is not None else None,
+                "actionable_close": str(session.get("actionable_close")) if session.get("actionable_close") is not None else None,
+            },
+            "account": account,
+            "entry_gate": {"allowed": bool(gate_allowed), "block_reasons": list(gate_reasons)},
+            "circuit_breaker": circuit_state,
+            "lifecycle_status_counts": statuses,
+            "open_positions": open_positions,
+            "broker_snapshot": {
+                "positions_available": snapshot.get("positions_available"),
+                "orders_available": snapshot.get("orders_available"),
+                "orders_truncated": snapshot.get("orders_truncated"),
+                "position_count": len(snapshot.get("positions", [])) if snapshot else None,
+                "order_count": len(snapshot.get("orders", [])) if snapshot else None,
+            },
+            "trade_analytics": analytics or {},
+            "anomalies_today": anomaly_counts,
+        }
+        try:
+            self._atomic_write_json(summary, path)
+        except Exception as exc:
+            self.log_message(f"Daily operational summary persistence failed: {exc}")
+            return summary
+
+        signature = (
+            bool(gate_allowed),
+            tuple(gate_reasons),
+            len(open_positions),
+            int((analytics or {}).get("completed_trades", 0) or 0),
+            round(float((analytics or {}).get("realized_pnl_dollars", 0.0) or 0.0), 2),
+            int(anomaly_counts.get("total", 0)),
+        )
+        if signature != getattr(self, "_last_daily_summary_log_signature", None):
+            self._last_daily_summary_log_signature = signature
+            self.log_message(
+                "DAILY OPERATIONAL SUMMARY: "
+                f"open_positions={len(open_positions)}, "
+                f"completed_trades={int((analytics or {}).get('completed_trades', 0) or 0)}, "
+                f"realized_pnl=${float((analytics or {}).get('realized_pnl_dollars', 0.0) or 0.0):,.2f}, "
+                f"entry_gate={'ALLOWED' if gate_allowed else 'BLOCKED'}, "
+                f"anomalies_today={int(anomaly_counts.get('total', 0))}."
+            )
+        return summary
+
+    def _load_trading_circuit_breaker_state(self):
+        self._trading_circuit_breaker_state = {}
+        self._circuit_breaker_state_integrity_ok = True
+        self._circuit_breaker_state_integrity_reason = ""
+        path = str(
+            getattr(self, "trading_circuit_breaker_state_path", "") or ""
+        )
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            if not isinstance(state, dict):
+                raise ValueError("circuit-breaker state root must be a JSON object")
+            self._trading_circuit_breaker_state = state
+        except Exception as exc:
+            self._circuit_breaker_state_integrity_ok = False
+            self._circuit_breaker_state_integrity_reason = str(exc)
+            self.log_message(
+                "Circuit-breaker state could not be loaded; NEW entries will "
+                f"remain blocked until the state file is repaired/removed and "
+                f"the strategy is restarted. Reason={exc}"
+            )
+            self._trading_circuit_breaker_state = {
+                "state_load_failed": True,
+                "latched_reasons": ["CIRCUIT_BREAKER_STATE_UNREADABLE"],
+            }
+
+    def _save_trading_circuit_breaker_state(self):
+        path = str(
+            getattr(self, "trading_circuit_breaker_state_path", "") or ""
+        )
+        if not path:
+            return
+        if not bool(getattr(self, "_circuit_breaker_state_integrity_ok", True)):
+            return
+        try:
+            self._atomic_write_json(self._trading_circuit_breaker_state, path)
+        except Exception as exc:
+            self.log_message(f"Could not persist circuit-breaker state: {exc}")
+
+    @staticmethod
+    def _as_eastern_date(value):
+        if not isinstance(value, datetime):
+            return None
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("America/New_York")).date()
+
+    def _current_trading_date(self, market_now=None):
+        if isinstance(market_now, datetime):
+            result = self._as_eastern_date(market_now)
+            if result is not None:
+                return result
+        now = self.get_datetime()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=ZoneInfo("America/New_York"))
+        return now.astimezone(ZoneInfo("America/New_York")).date()
+
+    def _daily_realized_pnl_for_date(self, trade_date):
+        total = 0.0
+        for position in self._tracked_alert_positions.values():
+            entry_basis = self._lifecycle_float(
+                position.get("actual_entry_debit_per_share", None),
+                None,
+            )
+            if entry_basis is None:
+                continue
+            ledger = position.get("broker_close_fill_ledger", {}) or {}
+            for fill in ledger.values():
+                filled_at = self._parse_lifecycle_datetime(
+                    fill.get("filled_at", "")
+                )
+                if self._as_eastern_date(filled_at) != trade_date:
+                    continue
+                qty = self._lifecycle_float(fill.get("filled_qty", 0.0), 0.0) or 0.0
+                credit = self._lifecycle_float(
+                    fill.get("credit_per_share", None),
+                    None,
+                )
+                if qty <= 0 or credit is None:
+                    continue
+                total += (
+                    (float(credit) - float(entry_basis))
+                    * 100.0
+                    * float(qty)
+                )
+        return float(total)
+
+    def _new_entry_count_for_date(self, trade_date):
+        count = 0
+        for position in self._tracked_alert_positions.values():
+            order_id = str(position.get("broker_entry_order_id", "") or "")
+            if not order_id:
+                continue
+            dt = self._parse_lifecycle_datetime(
+                position.get("broker_entry_submitted_at", "")
+            )
+            if dt is None:
+                dt = self._parse_lifecycle_datetime(
+                    position.get("actual_entry_filled_at", "")
+                )
+            if self._as_eastern_date(dt) == trade_date:
+                count += 1
+        return count
+
+    def _consecutive_losing_closed_trades(self):
+        rows = [
+            row
+            for row in self._trade_journal_rows()
+            if row.get("status") == "CLOSED"
+        ]
+        rows.sort(
+            key=lambda row: (
+                str(row.get("close_timestamp", "")),
+                str(row.get("lifecycle_id", "")),
+            ),
+            reverse=True,
+        )
+        count = 0
+        for row in rows:
+            pnl = self._lifecycle_float(
+                row.get("realized_pnl_dollars", 0.0),
+                0.0,
+            ) or 0.0
+            if pnl < 0:
+                count += 1
+            else:
+                break
+        return count
+
+    def _kill_switch_active(self):
+        env_active = self._env_bool("TRADING_KILL_SWITCH", False)
+        file_path = str(getattr(self, "trading_kill_switch_file", "") or "")
+        file_active = bool(file_path and os.path.exists(file_path))
+        return env_active or file_active, env_active, file_active
+
+    def refresh_trading_circuit_breakers(self, market_now=None, log_status=True):
+        if not bool(self.parameters.get("circuit_breaker_enabled", True)):
+            self._entry_execution_blocked_reasons = []
+            return {"enabled": False, "blocked": False}
+
+        trade_date = self._current_trading_date(market_now)
+        state = dict(getattr(self, "_trading_circuit_breaker_state", {}) or {})
+        today_text = trade_date.isoformat()
+        same_day = state.get("trading_date") == today_text
+
+        if not same_day:
+            state = {
+                "trading_date": today_text,
+                "latched_reasons": [],
+                "day_start_equity": None,
+                "day_peak_equity": None,
+                "last_updated_at": self.get_datetime().isoformat(),
+            }
+
+        dynamic_reasons = []
+        if not bool(getattr(self, "_circuit_breaker_state_integrity_ok", True)):
+            dynamic_reasons.append("CIRCUIT_BREAKER_STATE_UNREADABLE")
+        try:
+            account = self._get_account_risk_snapshot()
+            equity = float(account.get("equity", 0.0) or 0.0)
+            if equity <= 0:
+                raise ValueError("account equity is not positive")
+            if state.get("day_start_equity") in (None, 0, 0.0):
+                state["day_start_equity"] = equity
+            peak = self._lifecycle_float(
+                state.get("day_peak_equity", None),
+                None,
+            )
+            if peak is None or equity > peak:
+                peak = equity
+            state["day_peak_equity"] = float(peak)
+            state["current_equity"] = equity
+            state.pop("account_snapshot_error", None)
+        except Exception as exc:
+            equity = None
+            dynamic_reasons.append("ACCOUNT_SNAPSHOT_UNAVAILABLE")
+            state["account_snapshot_error"] = str(exc)
+
+        daily_realized = self._daily_realized_pnl_for_date(trade_date)
+        new_entries = self._new_entry_count_for_date(trade_date)
+        consecutive_losses = self._consecutive_losing_closed_trades()
+        orphaned = sorted(
+            {
+                str(position.get("underlying", "") or "")
+                for position in self._tracked_alert_positions.values()
+                if self._normalize_lifecycle_status(position.get("status", ""))
+                == "ORPHANED"
+            }
+        )
+
+        state["daily_realized_pnl_dollars"] = float(daily_realized)
+        state["new_entries_today"] = int(new_entries)
+        state["consecutive_losing_trades"] = int(consecutive_losses)
+        state["orphaned_underlyings"] = orphaned
+
+        latched = list(state.get("latched_reasons", []) or [])
+
+        def latch(reason):
+            if reason not in latched:
+                latched.append(reason)
+
+        start_equity = self._lifecycle_float(
+            state.get("day_start_equity", None),
+            None,
+        )
+        loss_pct = max(
+            0.0,
+            self._env_float(
+                "CIRCUIT_BREAKER_MAX_DAILY_REALIZED_LOSS_PCT_EQUITY",
+                self.parameters.get(
+                    "circuit_breaker_max_daily_realized_loss_pct_equity",
+                    0.01,
+                ),
+            ),
+        )
+        if (
+            start_equity
+            and loss_pct > 0
+            and daily_realized <= -(start_equity * loss_pct)
+        ):
+            latch("MAX_DAILY_REALIZED_LOSS")
+
+        drawdown_pct_limit = max(
+            0.0,
+            self._env_float(
+                "CIRCUIT_BREAKER_MAX_DAILY_EQUITY_DRAWDOWN_PCT",
+                self.parameters.get(
+                    "circuit_breaker_max_daily_equity_drawdown_pct",
+                    0.02,
+                ),
+            ),
+        )
+        peak_equity = self._lifecycle_float(
+            state.get("day_peak_equity", None),
+            None,
+        )
+        drawdown_pct = 0.0
+        if equity is not None and peak_equity and peak_equity > 0:
+            drawdown_pct = max(0.0, (peak_equity - equity) / peak_equity)
+            if drawdown_pct_limit > 0 and drawdown_pct >= drawdown_pct_limit:
+                latch("MAX_DAILY_EQUITY_DRAWDOWN")
+        state["daily_equity_drawdown_pct"] = float(drawdown_pct)
+
+        max_entries = max(
+            0,
+            self._env_int(
+                "CIRCUIT_BREAKER_MAX_NEW_ENTRIES_PER_DAY",
+                self.parameters.get("circuit_breaker_max_new_entries_per_day", 5),
+            ),
+        )
+        if max_entries > 0 and new_entries >= max_entries:
+            latch("MAX_NEW_ENTRIES_PER_DAY")
+
+        max_losses = max(
+            0,
+            self._env_int(
+                "CIRCUIT_BREAKER_MAX_CONSECUTIVE_LOSSES",
+                self.parameters.get("circuit_breaker_max_consecutive_losses", 3),
+            ),
+        )
+        if max_losses > 0 and consecutive_losses >= max_losses:
+            latch("MAX_CONSECUTIVE_LOSSES")
+
+        halt_orphaned = self._env_bool(
+            "CIRCUIT_BREAKER_HALT_ON_ORPHANED",
+            self.parameters.get("circuit_breaker_halt_on_orphaned", True),
+        )
+        if halt_orphaned and orphaned:
+            latch("ORPHANED_LIFECYCLE")
+
+        kill_active, kill_env, kill_file = self._kill_switch_active()
+        if kill_active:
+            dynamic_reasons.append("EMERGENCY_KILL_SWITCH")
+        if (
+            bool(self.parameters.get("startup_health_block_new_entries", True))
+            and not bool(getattr(self, "startup_health_entries_allowed", False))
+        ):
+            dynamic_reasons.append("STARTUP_HEALTH_FAILED")
+
+        state["latched_reasons"] = latched
+        state["kill_switch_env"] = bool(kill_env)
+        state["kill_switch_file"] = bool(kill_file)
+        state["last_updated_at"] = self.get_datetime().isoformat()
+        state["blocked"] = bool(latched or dynamic_reasons)
+        state["active_block_reasons"] = latched + [
+            reason for reason in dynamic_reasons if reason not in latched
+        ]
+
+        self._trading_circuit_breaker_state = state
+        self._entry_execution_blocked_reasons = list(
+            state["active_block_reasons"]
+        )
+        self._save_trading_circuit_breaker_state()
+
+        for reason in state["active_block_reasons"]:
+            if reason == "EMERGENCY_KILL_SWITCH":
+                continue
+            self._record_trading_anomaly(
+                "CIRCUIT_BREAKER_" + str(reason),
+                "WARNING",
+                f"New-entry circuit breaker is active: {reason}.",
+                context={
+                    "realized_today": float(daily_realized),
+                    "equity_drawdown_pct": float(drawdown_pct),
+                    "new_entries_today": int(new_entries),
+                    "consecutive_losses": int(consecutive_losses),
+                },
+            )
+
+        signature = (
+            tuple(state["active_block_reasons"]),
+            round(float(daily_realized), 2),
+            round(float(drawdown_pct), 5),
+            int(new_entries),
+            int(consecutive_losses),
+        )
+        if log_status and signature != getattr(self, "_last_circuit_breaker_log_signature", None):
+            self._last_circuit_breaker_log_signature = signature
+            self.log_message(
+                "TRADING CIRCUIT BREAKERS: "
+                + (
+                    "BLOCKING NEW ENTRIES"
+                    if state["blocked"]
+                    else "CLEAR"
+                )
+                + f" | realized_today=${daily_realized:,.2f}"
+                + f" | equity_drawdown={drawdown_pct * 100:.2f}%"
+                + (
+                    f" | new_entries={new_entries}/{max_entries}"
+                    if max_entries
+                    else f" | new_entries={new_entries}/OFF"
+                )
+                + (
+                    f" | consecutive_losses={consecutive_losses}/{max_losses}"
+                    if max_losses
+                    else f" | consecutive_losses={consecutive_losses}/OFF"
+                )
+                + (
+                    f" | reasons={','.join(state['active_block_reasons'])}"
+                    if state["active_block_reasons"]
+                    else ""
+                )
+            )
+        return state
+
+    def _new_entry_execution_safety_gate(self):
+        reasons = list(
+            getattr(self, "_entry_execution_blocked_reasons", []) or []
+        )
+        if (
+            bool(self.parameters.get("startup_health_block_new_entries", True))
+            and not bool(getattr(self, "startup_health_entries_allowed", False))
+            and "STARTUP_HEALTH_FAILED" not in reasons
+        ):
+            reasons.append("STARTUP_HEALTH_FAILED")
+        kill_active, _, _ = self._kill_switch_active()
+        if kill_active and "EMERGENCY_KILL_SWITCH" not in reasons:
+            reasons.append("EMERGENCY_KILL_SWITCH")
+        return (not reasons), reasons
+
+
+    # ======================================================
     # PERSISTENT ALERT-TRACKED SETUPS
     # ======================================================
 
@@ -13416,15 +17169,9 @@ class StockSuggestionStrategy(Strategy):
 
         try:
 
-            with open(
-                path,
-                "r",
-                encoding="utf-8",
-            ) as handle:
-
-                state = json.load(
-                    handle
-                )
+            state = self._load_trade_state_with_recovery(path)
+            if state is None:
+                return
 
             positions = state.get(
                 "positions",
@@ -13641,10 +17388,17 @@ class StockSuggestionStrategy(Strategy):
                     handle.fileno()
                 )
 
+            # Validate the complete temp file before touching the current
+            # lifecycle source of truth, then preserve a rotating valid backup.
+            self._read_valid_trade_state_file(temporary_path)
+            self._backup_current_trade_state()
+
             os.replace(
                 temporary_path,
                 path,
             )
+
+            self._lifecycle_state_integrity_ok = True
 
         except Exception as exc:
 
@@ -13878,6 +17632,51 @@ class StockSuggestionStrategy(Strategy):
                     ]
                 ),
 
+            "entry_stock_score":
+                self._lifecycle_float(
+                    row.get(
+                        "stock_score",
+                        None,
+                    ),
+                    None,
+                ),
+
+            "entry_option_score":
+                self._lifecycle_float(
+                    row.get(
+                        "option_score",
+                        None,
+                    ),
+                    None,
+                ),
+
+            "entry_iv":
+                self._lifecycle_float(
+                    row.get(
+                        "iv",
+                        None,
+                    ),
+                    None,
+                ),
+
+            "entry_reward_risk":
+                self._lifecycle_float(
+                    row.get(
+                        "reward_risk",
+                        None,
+                    ),
+                    None,
+                ),
+
+            "entry_selection_reason":
+                str(
+                    row.get(
+                        "reason",
+                        "",
+                    )
+                    or ""
+                ),
+
             "entry_option_daily_volume":
                 (
                     float(
@@ -13996,6 +17795,33 @@ class StockSuggestionStrategy(Strategy):
 
             "risk_reservation_evidence_complete":
                 False,
+
+            "actual_entry_debit_per_share":
+                None,
+
+            "actual_entry_filled_qty":
+                0.0,
+
+            "actual_entry_basis_source":
+                "",
+
+            "actual_entry_filled_at":
+                "",
+
+            "actual_entry_total_debit":
+                0.0,
+
+            "broker_close_fill_ledger":
+                {},
+
+            "actual_close_filled_qty":
+                0.0,
+
+            "actual_close_avg_credit_per_share":
+                None,
+
+            "actual_realized_pnl_dollars":
+                0.0,
 
             "broker_open_quantity":
                 0.0,
@@ -14646,49 +18472,46 @@ class StockSuggestionStrategy(Strategy):
                     - short_ask,
                 )
 
-            entry_debit = float(
-                position[
-                    "entry_debit_per_share"
-                ]
+            entry_debit = self._lifecycle_float(
+                position.get(
+                    "actual_entry_debit_per_share",
+                    None,
+                ),
+                None,
             )
 
-            if entry_debit <= 0:
+            if (
+                entry_debit is None
+                or entry_debit <= 0
+            ):
+                self.log_message(
+                    f"{position['underlying']}: exit management skipped; "
+                    "broker-confirmed actual entry fill basis is unavailable."
+                )
                 continue
 
-            planned_quantity = int(
-                position[
-                    "quantity"
-                ]
-            )
+            broker_open_quantity = self._lifecycle_float(
+                position.get(
+                    "broker_open_quantity",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0
 
-            try:
+            if broker_open_quantity <= 0:
+                self.log_message(
+                    f"{position['underlying']}: exit management skipped; "
+                    "no broker-confirmed open quantity remains."
+                )
+                continue
 
-                broker_open_quantity = float(
-                    position.get(
-                        "broker_open_quantity",
-                        0.0,
+            quantity = max(
+                1,
+                int(
+                    round(
+                        broker_open_quantity
                     )
-                    or 0.0
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                broker_open_quantity = 0.0
-
-            quantity = (
-                max(
-                    1,
-                    int(
-                        round(
-                            broker_open_quantity
-                        )
-                    ),
-                )
-                if broker_open_quantity > 0
-                else planned_quantity
+                ),
             )
 
             current_total_value = (
@@ -14697,25 +18520,40 @@ class StockSuggestionStrategy(Strategy):
                 * quantity
             )
 
-            # Until the future actual-fill P/L phase, keep the
-            # alert-estimated debit/share basis but scale it to
-            # the broker-reconciled open quantity.
             entry_total_debit = (
                 entry_debit
                 * 100
                 * quantity
             )
 
-            pnl_dollars = (
+            unrealized_pnl_dollars = (
                 current_total_value
                 - entry_total_debit
             )
 
-            pnl_pct = (
+            unrealized_pnl_pct = (
                 current_value
                 / entry_debit
                 - 1
             )
+
+            realized_pnl_dollars = self._lifecycle_float(
+                position.get(
+                    "actual_realized_pnl_dollars",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0
+
+            total_pnl_dollars = (
+                realized_pnl_dollars
+                + unrealized_pnl_dollars
+            )
+
+            # Keep the historic aliases for downstream alert formatting,
+            # but they now mean actual-fill unrealized % and total P/L $.
+            pnl_pct = unrealized_pnl_pct
+            pnl_dollars = total_pnl_dollars
 
             try:
 
@@ -14915,6 +18753,15 @@ class StockSuggestionStrategy(Strategy):
                     "entry_debit":
                         entry_debit,
 
+                    "entry_basis_source":
+                        str(
+                            position.get(
+                                "actual_entry_basis_source",
+                                "BROKER_FILL",
+                            )
+                            or "BROKER_FILL"
+                        ),
+
                     "current_value":
                         current_value,
 
@@ -14923,6 +18770,18 @@ class StockSuggestionStrategy(Strategy):
 
                     "pnl_dollars":
                         pnl_dollars,
+
+                    "unrealized_pnl_pct":
+                        unrealized_pnl_pct,
+
+                    "unrealized_pnl_dollars":
+                        unrealized_pnl_dollars,
+
+                    "realized_pnl_dollars":
+                        realized_pnl_dollars,
+
+                    "total_pnl_dollars":
+                        total_pnl_dollars,
 
                     "dte":
                         dte,
@@ -14991,9 +18850,12 @@ class StockSuggestionStrategy(Strategy):
                 "decision",
                 "quantity",
                 "entry_debit",
+                "entry_basis_source",
                 "current_value",
-                "pnl_pct",
-                "pnl_dollars",
+                "unrealized_pnl_pct",
+                "unrealized_pnl_dollars",
+                "realized_pnl_dollars",
+                "total_pnl_dollars",
                 "dte",
                 "days_held",
                 "quote_age_seconds",
@@ -15028,39 +18890,46 @@ class StockSuggestionStrategy(Strategy):
         )
 
         display[
-            "pnl_pct"
+            "unrealized_pnl_pct"
         ] = (
             pd.to_numeric(
                 display[
-                    "pnl_pct"
+                    "unrealized_pnl_pct"
                 ],
                 errors="coerce",
             )
             * 100
         ).round(1)
 
-        display[
-            "pnl_dollars"
-        ] = (
-            pd.to_numeric(
-                display[
-                    "pnl_dollars"
-                ],
-                errors="coerce",
+        for column in [
+            "unrealized_pnl_dollars",
+            "realized_pnl_dollars",
+            "total_pnl_dollars",
+        ]:
+            display[column] = (
+                pd.to_numeric(
+                    display[column],
+                    errors="coerce",
+                )
+                .round(2)
             )
-            .round(2)
-        )
 
         display = display.rename(
             columns={
                 "entry_debit":
-                    "entry_debit/share",
+                    "actual_entry/share",
+                "entry_basis_source":
+                    "entry_source",
                 "current_value":
                     "exit_value/share",
-                "pnl_pct":
-                    "pnl_%",
-                "pnl_dollars":
-                    "pnl_$",
+                "unrealized_pnl_pct":
+                    "unrealized_%",
+                "unrealized_pnl_dollars":
+                    "unrealized_$",
+                "realized_pnl_dollars":
+                    "realized_$",
+                "total_pnl_dollars":
+                    "total_pnl_$",
                 "days_held":
                     "held_days",
                 "quote_age_seconds":
@@ -15100,8 +18969,9 @@ class StockSuggestionStrategy(Strategy):
         exit_results,
     ):
 
-        if exit_results.empty:
+        self._paper_exit_orders_submitted_this_run = 0
 
+        if exit_results.empty:
             return []
 
         today = str(
@@ -15121,9 +18991,7 @@ class StockSuggestionStrategy(Strategy):
             )
         ]
 
-        for _, row in (
-            actionable.iterrows()
-        ):
+        for _, row in actionable.iterrows():
 
             position_id = str(
                 row[
@@ -15131,11 +18999,8 @@ class StockSuggestionStrategy(Strategy):
                 ]
             )
 
-            position = (
-                self._tracked_alert_positions
-                .get(
-                    position_id
-                )
+            position = self._tracked_alert_positions.get(
+                position_id
             )
 
             if position is None:
@@ -15167,7 +19032,42 @@ class StockSuggestionStrategy(Strategy):
                 == action
             )
 
-            if already_alerted:
+            today_close_client_id = (
+                self._paper_exit_execution_client_order_id(
+                    position_id,
+                    today,
+                )
+                if (
+                    action == "CLOSE"
+                    and self.paper_exit_execution_armed
+                )
+                else ""
+            )
+
+            already_has_today_close_order = (
+                bool(today_close_client_id)
+                and str(
+                    position.get(
+                        "broker_close_client_order_id",
+                        "",
+                    )
+                    or ""
+                )
+                == today_close_client_id
+            )
+
+            should_execute_close = (
+                action == "CLOSE"
+                and self.paper_exit_execution_armed
+                and not already_has_today_close_order
+            )
+
+            emit_alert = not already_alerted
+
+            if (
+                not emit_alert
+                and not should_execute_close
+            ):
                 continue
 
             short_contract = str(
@@ -15185,188 +19085,207 @@ class StockSuggestionStrategy(Strategy):
             )
 
             if short_contract:
-
                 legs += (
                     " / "
                     + short_contract
                 )
 
             payload = {
-                "timestamp":
-                    self.get_datetime()
-                    .isoformat(),
-
-                "lifecycle_id":
-                    position_id,
-
-                "lifecycle_status_before":
-                    self._normalize_lifecycle_status(
-                        position.get(
-                            "status",
-                            "ALERTED",
-                        )
-                    ),
-
-                "action":
-                    action,
-
-                "underlying":
-                    str(
-                        row[
-                            "underlying"
-                        ]
-                    ),
-
-                "direction":
-                    str(
-                        row[
-                            "direction"
-                        ]
-                    ),
-
-                "decision":
-                    str(
-                        row[
-                            "decision"
-                        ]
-                    ),
-
-                "quantity":
-                    int(
-                        row[
-                            "quantity"
-                        ]
-                    ),
-
-                "legs":
-                    legs,
-
-                "entry_debit_per_share":
-                    float(
-                        row[
-                            "entry_debit"
-                        ]
-                    ),
-
-                "estimated_exit_value_per_share":
-                    float(
-                        row[
-                            "current_value"
-                        ]
-                    ),
-
-                "estimated_pnl_pct":
-                    float(
-                        row[
-                            "pnl_pct"
-                        ]
-                    ),
-
-                "estimated_pnl_dollars":
-                    float(
-                        row[
-                            "pnl_dollars"
-                        ]
-                    ),
-
-                "dte":
-                    int(
-                        row[
-                            "dte"
-                        ]
-                    ),
-
-                "days_held":
-                    int(
-                        row[
-                            "days_held"
-                        ]
-                    ),
-
-                "thesis_state":
-                    str(
-                        row[
-                            "thesis_state"
-                        ]
-                    ),
-
-                "reason":
-                    str(
-                        row[
-                            "reason"
-                        ]
-                    ),
-
-                "mode":
-                    "ALERT_ONLY_NO_ORDER",
+                "timestamp": self.get_datetime().isoformat(),
+                "lifecycle_id": position_id,
+                "lifecycle_status_before": self._normalize_lifecycle_status(
+                    position.get(
+                        "status",
+                        "ALERTED",
+                    )
+                ),
+                "action": action,
+                "underlying": str(
+                    row[
+                        "underlying"
+                    ]
+                ),
+                "direction": str(
+                    row[
+                        "direction"
+                    ]
+                ),
+                "decision": str(
+                    row[
+                        "decision"
+                    ]
+                ),
+                "quantity": int(
+                    row[
+                        "quantity"
+                    ]
+                ),
+                "legs": legs,
+                "actual_entry_debit_per_share": float(
+                    row[
+                        "entry_debit"
+                    ]
+                ),
+                "entry_basis_source": str(
+                    row.get(
+                        "entry_basis_source",
+                        "BROKER_FILL",
+                    )
+                    or "BROKER_FILL"
+                ),
+                "estimated_exit_value_per_share": float(
+                    row[
+                        "current_value"
+                    ]
+                ),
+                "unrealized_pnl_pct": float(
+                    row[
+                        "unrealized_pnl_pct"
+                    ]
+                ),
+                "unrealized_pnl_dollars": float(
+                    row[
+                        "unrealized_pnl_dollars"
+                    ]
+                ),
+                "realized_pnl_dollars": float(
+                    row[
+                        "realized_pnl_dollars"
+                    ]
+                ),
+                "total_pnl_dollars": float(
+                    row[
+                        "total_pnl_dollars"
+                    ]
+                ),
+                # Backward-compatible aliases now based on actual fill.
+                "estimated_pnl_pct": float(
+                    row[
+                        "unrealized_pnl_pct"
+                    ]
+                ),
+                "estimated_pnl_dollars": float(
+                    row[
+                        "total_pnl_dollars"
+                    ]
+                ),
+                "dte": int(
+                    row[
+                        "dte"
+                    ]
+                ),
+                "days_held": int(
+                    row[
+                        "days_held"
+                    ]
+                ),
+                "thesis_state": str(
+                    row[
+                        "thesis_state"
+                    ]
+                ),
+                "reason": str(
+                    row[
+                        "reason"
+                    ]
+                ),
+                "mode": (
+                    "ALPACA_PAPER_EXIT_EXECUTION_ARMED"
+                    if (
+                        action == "CLOSE"
+                        and self.paper_exit_execution_armed
+                    )
+                    else "ALERT_ONLY_NO_ORDER"
+                ),
             }
 
-            self.log_message(
-                "\n\n"
-                "========== EXIT ALERT ==========\n"
-                f"{payload['action']} | "
-                f"{payload['underlying']} | "
-                f"{payload['decision']}\n"
-                f"Lifecycle: {payload['lifecycle_id']} "
-                f"[{payload['lifecycle_status_before']}]\n"
-                f"Contracts: "
-                f"{payload['quantity']}\n"
-                f"Legs: "
-                f"{payload['legs']}\n"
-                f"Entry debit/share: "
-                f"${payload['entry_debit_per_share']:.2f}\n"
-                f"Estimated exit value/share: "
-                f"${payload['estimated_exit_value_per_share']:.2f}\n"
-                f"Estimated P/L: "
-                f"{payload['estimated_pnl_pct'] * 100:.1f}% "
-                f"(${payload['estimated_pnl_dollars']:,.2f})\n"
-                f"DTE: "
-                f"{payload['dte']}\n"
-                f"Held: "
-                f"{payload['days_held']} day(s)\n"
-                f"Thesis: "
-                f"{payload['thesis_state']}\n"
-                f"Reason: "
-                f"{payload['reason']}\n"
-                "MODE: ALERT ONLY - NO ORDER SUBMITTED\n"
-                "================================"
-            )
-
-            self._append_exit_alert_jsonl(
-                payload
-            )
-
-            position[
-                "last_exit_alert_date"
-            ] = today
-
-            position[
-                "last_exit_alert_action"
-            ] = action
-
-            position[
-                "pending_management_action"
-            ] = action
-
-            if action == "CLOSE":
-
-                self._transition_trade_lifecycle(
-                    position,
-                    "CLOSE_ALERTED",
-                    "Exit-management close alert emitted; "
-                    "awaiting broker reconciliation",
-                    details={
-                        "estimated_pnl_pct": payload[
-                            "estimated_pnl_pct"
-                        ],
-                        "reason": payload[
-                            "reason"
-                        ],
-                    },
+            if emit_alert:
+                self.log_message(
+                    "\n\n"
+                    "========== EXIT ALERT ==========\n"
+                    f"{payload['action']} | "
+                    f"{payload['underlying']} | "
+                    f"{payload['decision']}\n"
+                    f"Lifecycle: {payload['lifecycle_id']} "
+                    f"[{payload['lifecycle_status_before']}]\n"
+                    f"Contracts: {payload['quantity']}\n"
+                    f"Legs: {payload['legs']}\n"
+                    f"Actual entry/share: "
+                    f"${payload['actual_entry_debit_per_share']:.2f} "
+                    f"[{payload['entry_basis_source']}]\n"
+                    f"Executable exit value/share: "
+                    f"${payload['estimated_exit_value_per_share']:.2f}\n"
+                    f"Unrealized P/L: "
+                    f"{payload['unrealized_pnl_pct'] * 100:.1f}% "
+                    f"(${payload['unrealized_pnl_dollars']:,.2f})\n"
+                    f"Realized P/L: "
+                    f"${payload['realized_pnl_dollars']:,.2f}\n"
+                    f"Total P/L: "
+                    f"${payload['total_pnl_dollars']:,.2f}\n"
+                    f"DTE: {payload['dte']}\n"
+                    f"Held: {payload['days_held']} day(s)\n"
+                    f"Thesis: {payload['thesis_state']}\n"
+                    f"Reason: {payload['reason']}\n"
+                    + (
+                        "MODE: ALPACA PAPER EXIT EXECUTION ARMED\n"
+                        if (
+                            action == "CLOSE"
+                            and self.paper_exit_execution_armed
+                        )
+                        else "MODE: ALERT ONLY - NO ORDER SUBMITTED\n"
+                    )
+                    + "================================"
                 )
 
-            else:
+                position[
+                    "last_exit_alert_date"
+                ] = today
+                position[
+                    "last_exit_alert_action"
+                ] = action
+                position[
+                    "pending_management_action"
+                ] = action
 
+            if action == "CLOSE":
+                position[
+                    "journal_exit_signal_reason"
+                ] = payload[
+                    "reason"
+                ]
+                position[
+                    "journal_exit_signal_at"
+                ] = self.get_datetime().isoformat()
+
+                current_status = self._normalize_lifecycle_status(
+                    position.get(
+                        "status",
+                        "OPEN",
+                    )
+                )
+
+                if current_status not in {
+                    "CLOSE_WORKING",
+                    "PARTIALLY_CLOSED",
+                }:
+                    self._transition_trade_lifecycle(
+                        position,
+                        "CLOSE_ALERTED",
+                        "Exit-management close signal emitted from actual-fill P/L; "
+                        "awaiting PAPER close submission/reconciliation",
+                        details={
+                            "unrealized_pnl_pct": payload[
+                                "unrealized_pnl_pct"
+                            ],
+                            "realized_pnl_dollars": payload[
+                                "realized_pnl_dollars"
+                            ],
+                            "reason": payload[
+                                "reason"
+                            ],
+                        },
+                    )
+            elif emit_alert:
                 self._record_lifecycle_event(
                     position,
                     "ADJUST_ALERT_EMITTED",
@@ -15374,8 +19293,8 @@ class StockSuggestionStrategy(Strategy):
                         "reason"
                     ],
                     details={
-                        "estimated_pnl_pct": payload[
-                            "estimated_pnl_pct"
+                        "unrealized_pnl_pct": payload[
+                            "unrealized_pnl_pct"
                         ],
                     },
                 )
@@ -15383,21 +19302,551 @@ class StockSuggestionStrategy(Strategy):
             self._tracked_alert_positions[
                 position_id
             ] = position
-
             self._save_trade_alert_positions_state()
 
-            alerts.append(
-                payload
-            )
+            execution_result = None
+
+            if should_execute_close:
+                execution_result = self._execute_paper_option_exit(
+                    row,
+                    position_id,
+                )
+                payload[
+                    "paper_exit_execution"
+                ] = execution_result
+                self._log_paper_exit_execution_result(
+                    payload,
+                    execution_result,
+                )
+
+            if emit_alert or execution_result is not None:
+                self._append_exit_alert_jsonl(
+                    payload
+                )
+                alerts.append(
+                    payload
+                )
 
         if alerts:
-
             self.log_message(
-                f"Generated {len(alerts)} "
-                "close/adjust alert(s)."
+                f"Generated {len(alerts)} close/adjust action record(s)."
             )
 
         return alerts
+
+    # ======================================================
+    # TRADE JOURNAL + ANALYTICS
+    # ======================================================
+
+    @staticmethod
+    def _trade_journal_score_bucket(score):
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return "UNKNOWN"
+        if not math.isfinite(value):
+            return "UNKNOWN"
+        if value >= 85:
+            return "85+"
+        if value >= 80:
+            return "80-84.99"
+        if value >= 75:
+            return "75-79.99"
+        if value >= 70:
+            return "70-74.99"
+        return "<70"
+
+    def _trade_journal_datetime(self, value):
+        return self._parse_lifecycle_datetime(value)
+
+    def _trade_journal_close_timestamp(self, position):
+        latest = None
+        ledger = position.get("broker_close_fill_ledger", {}) or {}
+        for fill in ledger.values():
+            dt = self._trade_journal_datetime(fill.get("filled_at", ""))
+            if dt is not None and (latest is None or dt > latest):
+                latest = dt
+        if latest is not None:
+            return latest
+        if self._normalize_lifecycle_status(position.get("status", "")) == "CLOSED":
+            return self._trade_journal_datetime(position.get("status_updated_at", ""))
+        return None
+
+    def _update_trade_journal_marks(self, exit_results):
+        """Persist last mark plus MAE/MFE without changing trade decisions."""
+        if not bool(self.parameters.get("trade_journal_enabled", True)):
+            return
+        if exit_results is None or exit_results.empty:
+            return
+
+        changed = False
+        now_text = self.get_datetime().isoformat()
+        for _, row in exit_results.iterrows():
+            lifecycle_id = str(row.get("position_id", "") or "")
+            position = self._tracked_alert_positions.get(lifecycle_id)
+            if not isinstance(position, dict):
+                continue
+
+            pnl_pct = self._lifecycle_float(row.get("unrealized_pnl_pct", None), None)
+            pnl_dollars = self._lifecycle_float(row.get("unrealized_pnl_dollars", None), None)
+            total_pnl = self._lifecycle_float(row.get("total_pnl_dollars", None), None)
+            current_value = self._lifecycle_float(row.get("current_value", None), None)
+            if pnl_pct is None or not math.isfinite(float(pnl_pct)):
+                continue
+
+            position["journal_last_mark_at"] = now_text
+            position["journal_last_exit_value_per_share"] = current_value
+            position["journal_last_unrealized_pnl_pct"] = float(pnl_pct)
+            position["journal_last_unrealized_pnl_dollars"] = pnl_dollars
+            position["journal_last_total_pnl_dollars"] = total_pnl
+
+            old_mae_pct = self._lifecycle_float(position.get("journal_mae_unrealized_pct", None), None)
+            old_mfe_pct = self._lifecycle_float(position.get("journal_mfe_unrealized_pct", None), None)
+            old_mae_dollars = self._lifecycle_float(position.get("journal_mae_unrealized_dollars", None), None)
+            old_mfe_dollars = self._lifecycle_float(position.get("journal_mfe_unrealized_dollars", None), None)
+
+            position["journal_mae_unrealized_pct"] = float(pnl_pct) if old_mae_pct is None else min(float(old_mae_pct), float(pnl_pct))
+            position["journal_mfe_unrealized_pct"] = float(pnl_pct) if old_mfe_pct is None else max(float(old_mfe_pct), float(pnl_pct))
+
+            if pnl_dollars is not None and math.isfinite(float(pnl_dollars)):
+                position["journal_mae_unrealized_dollars"] = float(pnl_dollars) if old_mae_dollars is None else min(float(old_mae_dollars), float(pnl_dollars))
+                position["journal_mfe_unrealized_dollars"] = float(pnl_dollars) if old_mfe_dollars is None else max(float(old_mfe_dollars), float(pnl_dollars))
+
+            self._tracked_alert_positions[lifecycle_id] = position
+            changed = True
+
+        if changed:
+            self._save_trade_alert_positions_state()
+
+    def _trade_journal_rows(self):
+        rows = []
+        for lifecycle_id, position in self._tracked_alert_positions.items():
+            if str(position.get("asset_type", "OPTION") or "OPTION").upper() != "OPTION":
+                continue
+            status = self._normalize_lifecycle_status(position.get("status", "ALERTED"))
+            if status == "SUPERSEDED":
+                continue
+
+            entry_qty = self._lifecycle_float(position.get("actual_entry_filled_qty", 0.0), 0.0) or 0.0
+            peak_qty = self._lifecycle_float(position.get("broker_peak_open_quantity", 0.0), 0.0) or 0.0
+            if max(entry_qty, peak_qty) <= 0:
+                # Alert-only / rejected-without-fill records are lifecycle audit
+                # records, not executed trades, and are excluded from P/L stats.
+                continue
+
+            entry_basis = self._lifecycle_float(position.get("actual_entry_debit_per_share", None), None)
+            close_qty = self._lifecycle_float(position.get("actual_close_filled_qty", 0.0), 0.0) or 0.0
+            close_credit = self._lifecycle_float(position.get("actual_close_avg_credit_per_share", None), None)
+            realized = self._lifecycle_float(position.get("actual_realized_pnl_dollars", 0.0), 0.0) or 0.0
+            open_qty = self._lifecycle_float(position.get("broker_open_quantity", 0.0), 0.0) or 0.0
+
+            entry_dt = self._trade_journal_datetime(position.get("actual_entry_filled_at", ""))
+            if entry_dt is None:
+                entry_dt = self._trade_journal_datetime(position.get("entry_timestamp", ""))
+            close_dt = self._trade_journal_close_timestamp(position)
+
+            holding_hours = None
+            if entry_dt is not None and close_dt is not None:
+                holding_hours = max(0.0, (close_dt - entry_dt).total_seconds() / 3600.0)
+
+            realized_return_pct = None
+            if entry_basis is not None and entry_basis > 0 and close_qty > 0:
+                realized_cost = float(entry_basis) * 100.0 * float(close_qty)
+                if realized_cost > 0:
+                    realized_return_pct = float(realized) / realized_cost
+
+            completed_return_pct = realized_return_pct if status == "CLOSED" else None
+            max_risk = self._lifecycle_float(position.get("entry_max_risk", None), None)
+            score = self._lifecycle_float(position.get("entry_structure_score", None), None)
+
+            rows.append({
+                "lifecycle_id": str(lifecycle_id),
+                "status": status,
+                "underlying": str(position.get("underlying", "") or ""),
+                "direction": str(position.get("direction", "") or ""),
+                "decision": str(position.get("decision", "") or ""),
+                "entry_date": str(position.get("entry_date", "") or ""),
+                "entry_timestamp": str(position.get("entry_timestamp", "") or ""),
+                "actual_entry_filled_at": str(position.get("actual_entry_filled_at", "") or ""),
+                "close_timestamp": close_dt.isoformat() if close_dt is not None else "",
+                "expiration": str(position.get("expiration", "") or ""),
+                "long_contract": str(position.get("long_contract", "") or ""),
+                "short_contract": str(position.get("short_contract", "") or ""),
+                "planned_quantity": self._lifecycle_float(position.get("quantity", 0.0), 0.0) or 0.0,
+                "actual_entry_qty": float(entry_qty),
+                "open_qty": float(open_qty),
+                "actual_close_qty": float(close_qty),
+                "actual_entry_debit_per_share": entry_basis,
+                "actual_close_credit_per_share": close_credit,
+                "actual_entry_total_debit": self._lifecycle_float(position.get("actual_entry_total_debit", None), None),
+                "realized_pnl_dollars": float(realized),
+                "realized_return_pct": realized_return_pct,
+                "completed_return_pct": completed_return_pct,
+                "last_unrealized_pnl_pct": self._lifecycle_float(position.get("journal_last_unrealized_pnl_pct", None), None),
+                "last_unrealized_pnl_dollars": self._lifecycle_float(position.get("journal_last_unrealized_pnl_dollars", None), None),
+                "last_total_pnl_dollars": self._lifecycle_float(position.get("journal_last_total_pnl_dollars", None), None),
+                "mae_unrealized_pct": self._lifecycle_float(position.get("journal_mae_unrealized_pct", None), None),
+                "mfe_unrealized_pct": self._lifecycle_float(position.get("journal_mfe_unrealized_pct", None), None),
+                "mae_unrealized_dollars": self._lifecycle_float(position.get("journal_mae_unrealized_dollars", None), None),
+                "mfe_unrealized_dollars": self._lifecycle_float(position.get("journal_mfe_unrealized_dollars", None), None),
+                "last_mark_at": str(position.get("journal_last_mark_at", "") or ""),
+                "holding_hours": holding_hours,
+                "holding_days": (holding_hours / 24.0) if holding_hours is not None else None,
+                "entry_max_risk": max_risk,
+                "entry_max_reward": position.get("entry_max_reward", None),
+                "entry_breakeven": self._lifecycle_float(position.get("entry_breakeven", None), None),
+                "entry_structure_score": score,
+                "score_bucket": self._trade_journal_score_bucket(score),
+                "entry_stock_score": self._lifecycle_float(position.get("entry_stock_score", None), None),
+                "entry_option_score": self._lifecycle_float(position.get("entry_option_score", None), None),
+                "entry_iv": self._lifecycle_float(position.get("entry_iv", None), None),
+                "entry_iv_percentile": self._lifecycle_float(position.get("entry_iv_percentile", None), None),
+                "entry_iv_rank": self._lifecycle_float(position.get("entry_iv_rank", None), None),
+                "entry_iv_history_samples": self._lifecycle_float(position.get("entry_iv_history_samples", None), None),
+                "entry_event_risk": str(position.get("entry_event_risk", "UNKNOWN") or "UNKNOWN"),
+                "entry_reward_risk": self._lifecycle_float(position.get("entry_reward_risk", None), None),
+                "entry_selection_reason": str(position.get("entry_selection_reason", "") or ""),
+                "entry_basis_source": str(position.get("actual_entry_basis_source", "") or ""),
+                "exit_reason": str(position.get("journal_exit_signal_reason", "") or ""),
+                "exit_signal_at": str(position.get("journal_exit_signal_at", "") or ""),
+                "broker_entry_order_id": str(position.get("broker_entry_order_id", "") or ""),
+                "broker_entry_client_order_id": str(position.get("broker_entry_client_order_id", "") or ""),
+                "broker_close_order_id": str(position.get("broker_close_order_id", "") or ""),
+                "broker_close_client_order_id": str(position.get("broker_close_client_order_id", "") or ""),
+            })
+
+        rows.sort(key=lambda row: (row.get("entry_timestamp", ""), row.get("lifecycle_id", "")))
+        return rows
+
+    @staticmethod
+    def _trade_journal_json_number(value):
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _trade_analytics_group(self, completed, column):
+        output = {}
+        if completed.empty or column not in completed.columns:
+            return output
+        for key, group in completed.groupby(column, dropna=False):
+            label = "UNKNOWN" if pd.isna(key) or str(key).strip() == "" else str(key)
+            pnl = pd.to_numeric(group["realized_pnl_dollars"], errors="coerce").fillna(0.0)
+            returns = pd.to_numeric(group["completed_return_pct"], errors="coerce")
+            wins = int((pnl > 0).sum())
+            losses = int((pnl < 0).sum())
+            output[label] = {
+                "trades": int(len(group)),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": self._trade_journal_json_number(wins / len(group) if len(group) else None),
+                "realized_pnl_dollars": self._trade_journal_json_number(pnl.sum()),
+                "expectancy_dollars": self._trade_journal_json_number(pnl.mean() if len(group) else None),
+                "average_return_pct": self._trade_journal_json_number(returns.mean()),
+            }
+        return output
+
+    def _build_trade_analytics(self, journal_df):
+        if journal_df is None or journal_df.empty:
+            return {
+                "generated_at": self.get_datetime().isoformat(),
+                "executed_trades": 0,
+                "open_trades": 0,
+                "completed_trades": 0,
+                "realized_pnl_dollars": 0.0,
+                "message": "No broker-filled option lifecycles are available yet.",
+            }
+
+        completed = journal_df[journal_df["status"] == "CLOSED"].copy()
+        open_mask = journal_df["status"].isin({"PARTIALLY_OPEN", "OPEN", "CLOSE_ALERTED", "CLOSE_WORKING", "PARTIALLY_CLOSED", "ORPHANED"})
+        open_df = journal_df[open_mask].copy()
+
+        pnl = pd.to_numeric(completed.get("realized_pnl_dollars", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+        returns = pd.to_numeric(completed.get("completed_return_pct", pd.Series(dtype=float)), errors="coerce")
+        hold_days = pd.to_numeric(completed.get("holding_days", pd.Series(dtype=float)), errors="coerce")
+        wins = int((pnl > 0).sum())
+        losses = int((pnl < 0).sum())
+        breakeven = int((pnl == 0).sum())
+        gross_profit = float(pnl[pnl > 0].sum()) if len(pnl) else 0.0
+        gross_loss = float(pnl[pnl < 0].sum()) if len(pnl) else 0.0
+        profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0 else None
+
+        max_drawdown = 0.0
+        if not completed.empty:
+            ordered = completed.copy()
+            ordered["_close_sort"] = pd.to_datetime(ordered["close_timestamp"], errors="coerce", utc=True)
+            ordered = ordered.sort_values(["_close_sort", "entry_timestamp"], na_position="last")
+            curve = pd.to_numeric(ordered["realized_pnl_dollars"], errors="coerce").fillna(0.0).cumsum()
+            peak = curve.cummax().clip(lower=0.0)
+            drawdown = curve - peak
+            if len(drawdown):
+                max_drawdown = float(abs(min(0.0, float(drawdown.min()))))
+
+        open_unrealized = pd.to_numeric(open_df.get("last_unrealized_pnl_dollars", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+
+        analytics = {
+            "generated_at": self.get_datetime().isoformat(),
+            "executed_trades": int(len(journal_df)),
+            "open_trades": int(len(open_df)),
+            "completed_trades": int(len(completed)),
+            "wins": wins,
+            "losses": losses,
+            "breakeven": breakeven,
+            "win_rate": self._trade_journal_json_number(wins / len(completed) if len(completed) else None),
+            "realized_pnl_dollars": self._trade_journal_json_number(pnl.sum() if len(pnl) else 0.0),
+            "open_last_mark_unrealized_pnl_dollars": self._trade_journal_json_number(open_unrealized.sum() if len(open_unrealized) else 0.0),
+            "expectancy_dollars_per_completed_trade": self._trade_journal_json_number(pnl.mean() if len(completed) else None),
+            "average_completed_return_pct": self._trade_journal_json_number(returns.mean()),
+            "median_completed_return_pct": self._trade_journal_json_number(returns.median()),
+            "average_holding_days": self._trade_journal_json_number(hold_days.mean()),
+            "gross_profit_dollars": self._trade_journal_json_number(gross_profit),
+            "gross_loss_dollars": self._trade_journal_json_number(gross_loss),
+            "profit_factor": self._trade_journal_json_number(profit_factor),
+            "max_closed_trade_equity_drawdown_dollars": self._trade_journal_json_number(max_drawdown),
+            "by_decision": self._trade_analytics_group(completed, "decision"),
+            "by_direction": self._trade_analytics_group(completed, "direction"),
+            "by_score_bucket": self._trade_analytics_group(completed, "score_bucket"),
+            "by_event_risk": self._trade_analytics_group(completed, "entry_event_risk"),
+            "by_exit_reason": self._trade_analytics_group(completed, "exit_reason"),
+        }
+        return analytics
+
+    @staticmethod
+    def _atomic_write_dataframe_csv(df, path):
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temp = path + ".tmp"
+        df.to_csv(temp, index=False)
+        os.replace(temp, path)
+
+    @staticmethod
+    def _atomic_write_json(payload, path):
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temp = path + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+
+    def refresh_trade_journal_analytics(self):
+        """Regenerate journal + analytics atomically from lifecycle truth."""
+        if not bool(self.parameters.get("trade_journal_enabled", True)):
+            return None
+
+        rows = self._trade_journal_rows()
+        journal_df = pd.DataFrame(rows)
+        analytics = self._build_trade_analytics(journal_df)
+
+        try:
+            if self.trade_journal_csv_path:
+                self._atomic_write_dataframe_csv(journal_df, self.trade_journal_csv_path)
+            if self.trade_analytics_json_path:
+                self._atomic_write_json(analytics, self.trade_analytics_json_path)
+        except Exception as exc:
+            self.log_message(
+                "Trade journal/analytics persistence failed; trading state is "
+                f"unchanged. Reason={exc}"
+            )
+            return analytics
+
+        signature = (
+            int(analytics.get("executed_trades", 0) or 0),
+            int(analytics.get("open_trades", 0) or 0),
+            int(analytics.get("completed_trades", 0) or 0),
+            round(float(analytics.get("realized_pnl_dollars", 0.0) or 0.0), 2),
+        )
+        if (
+            bool(self.parameters.get("trade_journal_log_summary", True))
+            and signature != self._last_trade_analytics_log_signature
+        ):
+            self._last_trade_analytics_log_signature = signature
+            win_rate = analytics.get("win_rate")
+            win_rate_text = "N/A" if win_rate is None else f"{float(win_rate) * 100:.1f}%"
+            profit_factor = analytics.get("profit_factor")
+            pf_text = "N/A" if profit_factor is None else f"{float(profit_factor):.2f}"
+            self.log_message(
+                "TRADE JOURNAL ANALYTICS: "
+                f"executed={analytics.get('executed_trades', 0)}, "
+                f"open={analytics.get('open_trades', 0)}, "
+                f"completed={analytics.get('completed_trades', 0)}, "
+                f"realized P/L=${float(analytics.get('realized_pnl_dollars', 0.0) or 0.0):,.2f}, "
+                f"win rate={win_rate_text}, profit factor={pf_text}."
+            )
+
+        return analytics
+
+    # ======================================================
+    # CONTROLLED PAPER-ONLY EXIT VALIDATION
+    # ======================================================
+
+    def _apply_controlled_paper_exit_test(self, exit_results):
+        """Inject one restart-safe PAPER-only CLOSE for exact symbol.
+
+        The production exit request builder, idempotency key, broker linking,
+        lifecycle transitions, and fill accounting remain unchanged. This
+        helper only changes the selected row's management action to CLOSE.
+        """
+
+        if not self.paper_exit_test_armed:
+            return exit_results
+
+        if not self.alpaca_is_paper or not self.paper_exit_execution_armed:
+            raise RuntimeError(
+                "Controlled PAPER exit test reached runtime without PAPER-only "
+                "exit execution safeguards"
+            )
+
+        if exit_results is None or exit_results.empty:
+            self.log_message(
+                "CONTROLLED PAPER EXIT TEST DEFERRED: exit-management rows are "
+                "not available; no close order will be submitted."
+            )
+            return exit_results
+
+        symbol = self.paper_exit_test_symbol
+        token = self.paper_exit_test_token
+        token_hash = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
+
+        active_statuses = {
+            "PARTIALLY_OPEN",
+            "OPEN",
+        }
+
+        candidates = []
+        for lifecycle_id, position in self._tracked_alert_positions.items():
+            if str(position.get("asset_type", "OPTION") or "OPTION").upper() != "OPTION":
+                continue
+            if str(position.get("underlying", "") or "").upper() != symbol:
+                continue
+            status = self._normalize_lifecycle_status(
+                position.get("status", "ALERTED")
+            )
+            if status not in active_statuses:
+                continue
+            broker_open_qty = self._lifecycle_float(
+                position.get("broker_open_quantity", 0.0),
+                0.0,
+            ) or 0.0
+            if broker_open_qty <= 0:
+                continue
+            candidates.append((lifecycle_id, position))
+
+        if len(candidates) != 1:
+            self.log_message(
+                "CONTROLLED PAPER EXIT TEST FAIL-CLOSED: exact underlying "
+                f"{symbol} has {len(candidates)} broker-confirmed active "
+                "lifecycle(s); exactly one is required."
+            )
+            return exit_results
+
+        lifecycle_id, position = candidates[0]
+
+        if str(position.get("paper_exit_test_consumed_token_sha256", "") or "") == token_hash:
+            if not bool(position.get("paper_exit_test_consumed_log_emitted", False)):
+                self.log_message(
+                    "CONTROLLED PAPER EXIT TEST ALREADY CONSUMED: "
+                    f"{symbol} lifecycle={lifecycle_id}; this token cannot "
+                    "force another close. Use a new token for a new test."
+                )
+                position["paper_exit_test_consumed_log_emitted"] = True
+                self._tracked_alert_positions[lifecycle_id] = position
+                self._save_trade_alert_positions_state()
+            return exit_results
+
+        row_mask = (
+            exit_results["position_id"].astype(str) == str(lifecycle_id)
+        )
+        matching_rows = exit_results.loc[row_mask]
+
+        if len(matching_rows) != 1:
+            self.log_message(
+                "CONTROLLED PAPER EXIT TEST DEFERRED: exact lifecycle does not "
+                "have one usable exit-management row; no close order will be "
+                "submitted."
+            )
+            return exit_results
+
+        row_index = matching_rows.index[0]
+
+        entry_basis = self._lifecycle_float(
+            exit_results.at[row_index, "entry_debit"],
+            None,
+        )
+        exit_value = self._lifecycle_float(
+            exit_results.at[row_index, "current_value"],
+            None,
+        )
+        if (
+            entry_basis is None
+            or not math.isfinite(float(entry_basis))
+            or entry_basis <= 0
+            or exit_value is None
+            or not math.isfinite(float(exit_value))
+            or exit_value < 0
+        ):
+            self.log_message(
+                "CONTROLLED PAPER EXIT TEST DEFERRED: broker fill basis or "
+                "executable exit value is unavailable; no close order will be "
+                "submitted."
+            )
+            return exit_results
+
+        now = self.get_datetime()
+
+        # Consume before calling submit_order. A crash in the tiny gap between
+        # persistence and submission fails safe by NOT repeating a forced close.
+        position["paper_exit_test_consumed_token_sha256"] = token_hash
+        position["paper_exit_test_consumed_at"] = now.isoformat()
+        position["paper_exit_test_symbol"] = symbol
+        position["paper_exit_test_consumed_log_emitted"] = False
+        self._record_lifecycle_event(
+            position,
+            "CONTROLLED_PAPER_EXIT_TEST_TRIGGERED",
+            "Explicit PAPER-only validation token forced this lifecycle into "
+            "the normal CLOSE pipeline",
+            details={
+                "symbol": symbol,
+                "token_sha256": token_hash[:10],
+                "broker_open_quantity": self._lifecycle_float(
+                    position.get("broker_open_quantity", 0.0),
+                    0.0,
+                ) or 0.0,
+                "entry_basis": float(entry_basis),
+                "executable_exit_value": float(exit_value),
+            },
+        )
+        self._tracked_alert_positions[lifecycle_id] = position
+        self._save_trade_alert_positions_state()
+
+        exit_results = exit_results.copy()
+        original_action = str(exit_results.at[row_index, "action"] or "HOLD")
+        original_reason = str(exit_results.at[row_index, "reason"] or "")
+        exit_results.at[row_index, "action"] = "CLOSE"
+        exit_results.at[row_index, "reason"] = (
+            "CONTROLLED PAPER EXIT TEST: explicit one-shot PAPER-only close "
+            f"for {symbol}; production exit rule before override was "
+            f"{original_action}. "
+            + original_reason
+        ).strip()
+
+        self.log_message(
+            "CONTROLLED PAPER EXIT TEST TRIGGERED: "
+            f"{symbol} lifecycle={lifecycle_id}; forcing exactly the current "
+            "broker-confirmed open quantity through the normal PAPER close "
+            "order path. Token is now consumed."
+        )
+
+        return exit_results
 
 
     # ======================================================
@@ -15421,6 +19870,14 @@ class StockSuggestionStrategy(Strategy):
             )
         )
 
+        exit_results = self._apply_controlled_paper_exit_test(
+            exit_results
+        )
+
+        self._update_trade_journal_marks(
+            exit_results
+        )
+
         self.log_exit_management(
             exit_results
         )
@@ -15431,10 +19888,1477 @@ class StockSuggestionStrategy(Strategy):
             )
         )
 
+        self.refresh_trade_journal_analytics()
+
         return (
             exit_results,
             exit_alerts,
         )
+
+
+    # ======================================================
+    # OPTIONAL ALPACA PAPER ENTRY EXECUTION
+    # ======================================================
+
+    @staticmethod
+    def _paper_execution_client_order_id(
+        lifecycle_id,
+    ):
+        """Return a deterministic, compact idempotency key."""
+
+        digest = hashlib.sha256(
+            str(lifecycle_id).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:24]
+
+        return (
+            "lumi-pe-"
+            + digest
+        )
+
+
+    @staticmethod
+    def _paper_execution_order_not_found(
+        exc,
+    ):
+        status_code = getattr(
+            exc,
+            "status_code",
+            None,
+        )
+
+        if status_code == 404:
+            return True
+
+        text = str(exc).lower()
+
+        return (
+            "404" in text
+            or "not found" in text
+            or "order does not exist" in text
+        )
+
+
+    def _build_paper_option_entry_order_request(
+        self,
+        row,
+        client_order_id,
+    ):
+        """Build one PAPER-only DAY limit option entry request."""
+
+        decision = str(
+            row.get(
+                "decision",
+                "",
+            )
+            or ""
+        ).upper()
+
+        quantity = int(
+            row.get(
+                "quantity",
+                0,
+            )
+            or 0
+        )
+
+        if quantity <= 0:
+            raise ValueError(
+                "Paper execution requires positive option quantity"
+            )
+
+        round_decimals = max(
+            0,
+            int(
+                self.parameters.get(
+                    "paper_execution_limit_price_round_decimals",
+                    2,
+                )
+            ),
+        )
+
+        limit_price = round(
+            float(
+                row.get(
+                    "net_debit",
+                    0.0,
+                )
+                or 0.0
+            ),
+            round_decimals,
+        )
+
+        if limit_price <= 0:
+            raise ValueError(
+                "Paper execution requires a positive debit limit price"
+            )
+
+        long_contract = str(
+            row.get(
+                "long_contract",
+                "",
+            )
+            or ""
+        ).upper()
+
+        short_contract = str(
+            row.get(
+                "short_contract",
+                "",
+            )
+            or ""
+        ).upper()
+
+        if not long_contract:
+            raise ValueError(
+                "Paper execution is missing the long option contract"
+            )
+
+        if decision in {
+            "LONG CALL",
+            "LONG PUT",
+        }:
+            request = LimitOrderRequest(
+                symbol=long_contract,
+                qty=quantity,
+                side=OrderSide.BUY,
+                position_intent=(
+                    PositionIntent.BUY_TO_OPEN
+                ),
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+            )
+
+            return (
+                request,
+                limit_price,
+                "SIMPLE_OPTION_LIMIT",
+            )
+
+        if decision in {
+            "BULL CALL SPREAD",
+            "BEAR PUT SPREAD",
+        }:
+            if not short_contract:
+                raise ValueError(
+                    "Multi-leg paper execution is missing the short leg"
+                )
+
+            request = LimitOrderRequest(
+                qty=quantity,
+                order_class=OrderClass.MLEG,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+                legs=[
+                    OptionLegRequest(
+                        symbol=long_contract,
+                        ratio_qty=1,
+                        side=OrderSide.BUY,
+                        position_intent=(
+                            PositionIntent.BUY_TO_OPEN
+                        ),
+                    ),
+                    OptionLegRequest(
+                        symbol=short_contract,
+                        ratio_qty=1,
+                        side=OrderSide.SELL,
+                        position_intent=(
+                            PositionIntent.SELL_TO_OPEN
+                        ),
+                    ),
+                ],
+            )
+
+            return (
+                request,
+                limit_price,
+                "MLEG_DEBIT_LIMIT",
+            )
+
+        raise ValueError(
+            "Paper execution does not support structure "
+            f"{decision or 'UNKNOWN'}"
+        )
+
+
+    def _persist_paper_entry_order_link(
+        self,
+        position,
+        order,
+        client_order_id,
+        limit_price,
+        order_style,
+        source,
+    ):
+        """Persist returned broker identifiers into the lifecycle."""
+
+        now = self.get_datetime()
+
+        broker_order_id = str(
+            self._broker_field(
+                order,
+                "id",
+                "",
+            )
+            or ""
+        )
+
+        returned_client_order_id = str(
+            self._broker_field(
+                order,
+                "client_order_id",
+                "",
+            )
+            or client_order_id
+        )
+
+        status = self._enum_text(
+            self._broker_field(
+                order,
+                "status",
+                "",
+            )
+        )
+
+        position[
+            "broker_entry_order_id"
+        ] = broker_order_id
+        position[
+            "broker_entry_client_order_id"
+        ] = returned_client_order_id
+        position[
+            "broker_entry_order_status"
+        ] = status
+        position[
+            "broker_entry_order_style"
+        ] = order_style
+        position[
+            "broker_entry_limit_price"
+        ] = float(limit_price)
+        position[
+            "broker_entry_link_source"
+        ] = source
+        position[
+            "broker_entry_linked_at"
+        ] = now.isoformat()
+        position[
+            "paper_execution_enabled_at_entry"
+        ] = True
+
+        submitted_at = self._broker_field(
+            order,
+            "submitted_at",
+            None,
+        )
+
+        if submitted_at is not None:
+            position[
+                "broker_entry_submitted_at"
+            ] = str(submitted_at)
+
+        self._record_lifecycle_event(
+            position,
+            (
+                "PAPER_ENTRY_ORDER_RECOVERED"
+                if source == "EXISTING_CLIENT_ORDER_ID"
+                else "PAPER_ENTRY_ORDER_SUBMITTED"
+            ),
+            (
+                "Linked deterministic PAPER entry order "
+                f"{broker_order_id or returned_client_order_id}"
+            ),
+            details={
+                "broker_order_id": broker_order_id,
+                "client_order_id": returned_client_order_id,
+                "broker_status": status,
+                "limit_price": float(limit_price),
+                "order_style": order_style,
+                "link_source": source,
+            },
+        )
+
+        filled_qty = self._lifecycle_float(
+            self._broker_field(
+                order,
+                "filled_qty",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        requested_qty = self._lifecycle_float(
+            self._broker_field(
+                order,
+                "qty",
+                position.get(
+                    "quantity",
+                    0.0,
+                ),
+            ),
+            self._lifecycle_float(
+                position.get(
+                    "quantity",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0,
+        ) or 0.0
+
+        position[
+            "broker_entry_filled_qty"
+        ] = filled_qty
+        position[
+            "broker_entry_requested_qty"
+        ] = requested_qty
+        position[
+            "broker_entry_unfilled_qty"
+        ] = max(
+            0.0,
+            requested_qty - filled_qty,
+        )
+
+        terminal_without_fill = {
+            "canceled": "CANCELED",
+            "rejected": "REJECTED",
+            "expired": "EXPIRED",
+            "done_for_day": "EXPIRED",
+            "calculated": "EXPIRED",
+        }
+
+        tolerance = max(
+            0.0,
+            float(
+                self.parameters.get(
+                    "lifecycle_quantity_tolerance",
+                    1e-6,
+                )
+            ),
+        )
+
+        if (
+            status in terminal_without_fill
+            and filled_qty <= tolerance
+        ):
+            self._transition_trade_lifecycle(
+                position,
+                terminal_without_fill[status],
+                (
+                    "PAPER entry order returned terminal status "
+                    f"{status} without a fill"
+                ),
+                details={
+                    "broker_order_id": broker_order_id,
+                    "client_order_id": returned_client_order_id,
+                    "filled_qty": filled_qty,
+                },
+            )
+        else:
+            if (
+                status in terminal_without_fill
+                and filled_qty > tolerance
+            ):
+                position[
+                    "paper_entry_remainder_policy"
+                ] = str(
+                    self.parameters.get(
+                        "paper_entry_partial_fill_policy",
+                        "KEEP_PARTIAL_NO_TOP_UP",
+                    )
+                )
+                position[
+                    "paper_entry_top_up_allowed"
+                ] = False
+
+            # Position snapshots remain primary truth for OPEN/PARTIALLY_OPEN.
+            # A terminal order with a partial fill stays non-terminal here
+            # until reconciliation sees the smaller broker position.
+            self._transition_trade_lifecycle(
+                position,
+                "ENTRY_WORKING",
+                (
+                    "PAPER entry order linked; awaiting broker "
+                    "position reconciliation"
+                    + (
+                        "; terminal unfilled remainder will not be topped up"
+                        if (
+                            status in terminal_without_fill
+                            and filled_qty > tolerance
+                        )
+                        else ""
+                    )
+                ),
+                details={
+                    "broker_order_id": broker_order_id,
+                    "client_order_id": returned_client_order_id,
+                    "broker_status": status,
+                    "filled_qty": filled_qty,
+                    "requested_qty": requested_qty,
+                },
+            )
+
+        self._tracked_alert_positions[
+            position[
+                "id"
+            ]
+        ] = position
+
+        self._save_trade_alert_positions_state()
+
+        return {
+            "submitted": (
+                source == "SUBMIT_ORDER"
+            ),
+            "linked": True,
+            "order_id": broker_order_id,
+            "client_order_id": returned_client_order_id,
+            "status": status,
+            "limit_price": float(limit_price),
+            "order_style": order_style,
+            "source": source,
+        }
+
+
+    def _execute_paper_option_entry(
+        self,
+        row,
+        lifecycle_id,
+    ):
+        """Idempotently submit/link one Alpaca PAPER option entry."""
+
+        if not self.paper_execution_armed:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "DISABLED",
+                "reason": "PAPER execution is not armed",
+            }
+
+        if not self.alpaca_is_paper:
+            # Defense in depth in addition to initialize() hard fail.
+            raise RuntimeError(
+                "Paper execution attempted with a non-paper Alpaca client"
+            )
+
+        entry_allowed, block_reasons = self._new_entry_execution_safety_gate()
+        if not entry_allowed:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "SAFETY_BLOCKED",
+                "reason": "NEW entry blocked by production safety controls: "
+                + ", ".join(block_reasons),
+                "safety_block_reasons": block_reasons,
+            }
+
+        max_per_run = max(
+            0,
+            int(
+                self.parameters.get(
+                    "paper_execution_max_orders_per_run",
+                    5,
+                )
+            ),
+        )
+
+        if (
+            max_per_run > 0
+            and self._paper_execution_orders_submitted_this_run
+            >= max_per_run
+        ):
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "RUN_CAP",
+                "reason": "PAPER execution per-run order cap reached",
+            }
+
+        decision = str(
+            row.get(
+                "decision",
+                "",
+            )
+            or ""
+        ).upper()
+
+        required_options_level = (
+            3
+            if decision in {
+                "BULL CALL SPREAD",
+                "BEAR PUT SPREAD",
+            }
+            else 2
+        )
+
+        try:
+            known_options_level = int(
+                self.options_trading_level
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            known_options_level = None
+
+        if known_options_level is None:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "OPTIONS_LEVEL_UNKNOWN",
+                "reason": (
+                    "PAPER execution requires a known Alpaca options "
+                    "trading level and therefore fails closed"
+                ),
+            }
+
+        if known_options_level < required_options_level:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "OPTIONS_LEVEL_INSUFFICIENT",
+                "reason": (
+                    f"Structure requires Alpaca options level "
+                    f"{required_options_level}; account reports "
+                    f"level {known_options_level}"
+                ),
+            }
+
+        position = self._tracked_alert_positions.get(
+            lifecycle_id
+        )
+
+        if position is None:
+            raise RuntimeError(
+                "Lifecycle record must exist before PAPER execution"
+            )
+
+        if str(
+            position.get(
+                "asset_type",
+                "OPTION",
+            )
+            or "OPTION"
+        ).upper() != "OPTION":
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "UNSUPPORTED_ASSET",
+                "reason": "Only option entries are enabled in this phase",
+            }
+
+        client_order_id = (
+            self._paper_execution_client_order_id(
+                lifecycle_id
+            )
+        )
+
+        position[
+            "broker_entry_client_order_id"
+        ] = client_order_id
+        position[
+            "paper_execution_submission_planned_at"
+        ] = self.get_datetime().isoformat()
+
+        self._tracked_alert_positions[
+            lifecycle_id
+        ] = position
+        self._save_trade_alert_positions_state()
+
+        (
+            order_request,
+            limit_price,
+            order_style,
+        ) = self._build_paper_option_entry_order_request(
+            row,
+            client_order_id,
+        )
+
+        # Idempotency check. If a prior process submitted the order
+        # but crashed before persisting the UUID, recover by the
+        # deterministic client_order_id instead of submitting again.
+        try:
+            existing_order = (
+                self.alpaca_trading_client
+                .get_order_by_client_id(
+                    client_order_id
+                )
+            )
+
+        except Exception as exc:
+            if self._paper_execution_order_not_found(
+                exc
+            ):
+                existing_order = None
+            else:
+                position[
+                    "paper_execution_last_error"
+                ] = str(exc)
+                position[
+                    "paper_execution_last_error_at"
+                ] = self.get_datetime().isoformat()
+                self._save_trade_alert_positions_state()
+                return {
+                    "submitted": False,
+                    "linked": False,
+                    "status": "LOOKUP_FAILED",
+                    "reason": (
+                        "Could not verify deterministic client order ID; "
+                        "submission fails closed"
+                    ),
+                    "error": str(exc),
+                    "client_order_id": client_order_id,
+                }
+
+        if existing_order is not None:
+            return self._persist_paper_entry_order_link(
+                position,
+                existing_order,
+                client_order_id,
+                limit_price,
+                order_style,
+                "EXISTING_CLIENT_ORDER_ID",
+            )
+
+        try:
+            order = (
+                self.alpaca_trading_client
+                .submit_order(
+                    order_data=order_request
+                )
+            )
+
+        except Exception as exc:
+            position[
+                "paper_execution_last_error"
+            ] = str(exc)
+            position[
+                "paper_execution_last_error_at"
+            ] = self.get_datetime().isoformat()
+
+            self._record_lifecycle_event(
+                position,
+                "PAPER_ENTRY_SUBMISSION_FAILED",
+                "Alpaca PAPER entry submission failed",
+                details={
+                    "client_order_id": client_order_id,
+                    "limit_price": float(limit_price),
+                    "order_style": order_style,
+                    "error": str(exc),
+                },
+            )
+
+            self._tracked_alert_positions[
+                lifecycle_id
+            ] = position
+            self._save_trade_alert_positions_state()
+
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "SUBMIT_FAILED",
+                "reason": "Alpaca PAPER submit_order failed",
+                "error": str(exc),
+                "client_order_id": client_order_id,
+                "limit_price": float(limit_price),
+                "order_style": order_style,
+            }
+
+        self._paper_execution_orders_submitted_this_run += 1
+
+        return self._persist_paper_entry_order_link(
+            position,
+            order,
+            client_order_id,
+            limit_price,
+            order_style,
+            "SUBMIT_ORDER",
+        )
+
+
+    def _log_paper_execution_result(
+        self,
+        payload,
+        result,
+    ):
+        if not self.paper_execution_armed:
+            return
+
+        status = str(
+            result.get(
+                "status",
+                "UNKNOWN",
+            )
+            or "UNKNOWN"
+        )
+
+        if result.get(
+            "linked",
+            False,
+        ):
+            self.log_message(
+                "\n\n"
+                "======= ALPACA PAPER ENTRY ORDER =======\n"
+                f"{payload['direction']} | {payload['underlying']} | "
+                f"{payload['decision']}\n"
+                f"Lifecycle: {payload['lifecycle_id']}\n"
+                f"Broker order ID: {result.get('order_id', '')}\n"
+                f"Client order ID: {result.get('client_order_id', '')}\n"
+                f"Order style: {result.get('order_style', '')}\n"
+                f"Limit debit/share: ${result.get('limit_price', 0.0):.2f}\n"
+                f"Broker status: {status.upper()}\n"
+                f"Link source: {result.get('source', '')}\n"
+                "ACCOUNT: ALPACA PAPER ONLY\n"
+                "========================================"
+            )
+        else:
+            self.log_message(
+                "PAPER entry order was NOT submitted/linked for "
+                f"{payload['underlying']}: {result.get('reason', status)}"
+                + (
+                    f". Error={result.get('error')}"
+                    if result.get('error')
+                    else ""
+                )
+            )
+
+    @staticmethod
+    def _paper_exit_execution_client_order_id(
+        lifecycle_id,
+        trade_date,
+    ):
+        """Daily deterministic idempotency key for one PAPER close attempt."""
+
+        digest = hashlib.sha256(
+            (
+                str(lifecycle_id)
+                + "|"
+                + str(trade_date)
+            ).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:24]
+
+        return (
+            "lumi-px-"
+            + digest
+        )
+
+
+    def _build_paper_option_exit_order_request(
+        self,
+        row,
+        client_order_id,
+    ):
+        """Build one PAPER-only DAY limit close request."""
+
+        decision = str(
+            row.get(
+                "decision",
+                "",
+            )
+            or ""
+        ).upper()
+
+        quantity = int(
+            row.get(
+                "quantity",
+                0,
+            )
+            or 0
+        )
+
+        if quantity <= 0:
+            raise ValueError(
+                "Paper exit execution requires positive broker open quantity"
+            )
+
+        current_value = self._lifecycle_float(
+            row.get(
+                "current_value",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        if current_value <= 0:
+            raise ValueError(
+                "Paper exit execution requires a positive executable close value"
+            )
+
+        round_decimals = max(
+            0,
+            int(
+                self.parameters.get(
+                    "paper_exit_execution_limit_price_round_decimals",
+                    2,
+                )
+            ),
+        )
+
+        long_contract = str(
+            row.get(
+                "long_contract",
+                "",
+            )
+            or ""
+        ).upper()
+
+        short_contract = str(
+            row.get(
+                "short_contract",
+                "",
+            )
+            or ""
+        ).upper()
+
+        if not long_contract:
+            raise ValueError(
+                "Paper exit execution is missing the long option contract"
+            )
+
+        if decision in {
+            "LONG CALL",
+            "LONG PUT",
+        }:
+            limit_price = round(
+                current_value,
+                round_decimals,
+            )
+
+            if limit_price <= 0:
+                raise ValueError(
+                    "Rounded simple-option close limit is not positive"
+                )
+
+            request = LimitOrderRequest(
+                symbol=long_contract,
+                qty=quantity,
+                side=OrderSide.SELL,
+                position_intent=(
+                    PositionIntent.SELL_TO_CLOSE
+                ),
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+            )
+
+            return (
+                request,
+                limit_price,
+                "SIMPLE_OPTION_CLOSE_LIMIT",
+            )
+
+        if decision in {
+            "BULL CALL SPREAD",
+            "BEAR PUT SPREAD",
+        }:
+            if not short_contract:
+                raise ValueError(
+                    "Multi-leg paper exit is missing the short leg"
+                )
+
+            # Alpaca MLEG convention: negative limit = credit received.
+            limit_price = round(
+                -current_value,
+                round_decimals,
+            )
+
+            if limit_price >= 0:
+                raise ValueError(
+                    "MLEG close credit limit must be negative"
+                )
+
+            request = LimitOrderRequest(
+                qty=quantity,
+                order_class=OrderClass.MLEG,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+                legs=[
+                    OptionLegRequest(
+                        symbol=long_contract,
+                        ratio_qty=1,
+                        side=OrderSide.SELL,
+                        position_intent=(
+                            PositionIntent.SELL_TO_CLOSE
+                        ),
+                    ),
+                    OptionLegRequest(
+                        symbol=short_contract,
+                        ratio_qty=1,
+                        side=OrderSide.BUY,
+                        position_intent=(
+                            PositionIntent.BUY_TO_CLOSE
+                        ),
+                    ),
+                ],
+            )
+
+            return (
+                request,
+                limit_price,
+                "MLEG_CREDIT_CLOSE_LIMIT",
+            )
+
+        raise ValueError(
+            "Paper exit execution does not support structure "
+            f"{decision or 'UNKNOWN'}"
+        )
+
+
+    def _persist_paper_exit_order_link(
+        self,
+        position,
+        order,
+        client_order_id,
+        limit_price,
+        order_style,
+        source,
+    ):
+        """Persist a PAPER close order and move lifecycle to close-working."""
+
+        now = self.get_datetime()
+
+        broker_order_id = str(
+            self._broker_field(
+                order,
+                "id",
+                "",
+            )
+            or ""
+        )
+
+        returned_client_order_id = str(
+            self._broker_field(
+                order,
+                "client_order_id",
+                "",
+            )
+            or client_order_id
+        )
+
+        status = self._enum_text(
+            self._broker_field(
+                order,
+                "status",
+                "",
+            )
+        )
+
+        filled_qty = self._lifecycle_float(
+            self._broker_field(
+                order,
+                "filled_qty",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        filled_avg_price = self._lifecycle_float(
+            self._broker_field(
+                order,
+                "filled_avg_price",
+                None,
+            ),
+            None,
+        )
+
+        position[
+            "broker_close_order_id"
+        ] = broker_order_id
+        position[
+            "broker_close_client_order_id"
+        ] = returned_client_order_id
+        position[
+            "broker_close_order_status"
+        ] = status
+        position[
+            "broker_close_filled_qty"
+        ] = filled_qty
+        position[
+            "broker_close_filled_avg_price"
+        ] = filled_avg_price
+        position[
+            "broker_close_order_style"
+        ] = order_style
+        position[
+            "broker_close_limit_price"
+        ] = float(limit_price)
+        position[
+            "broker_close_link_source"
+        ] = source
+        position[
+            "broker_close_linked_at"
+        ] = now.isoformat()
+        position[
+            "paper_exit_execution_enabled_at_close"
+        ] = True
+
+        terminal_statuses = {
+            "canceled",
+            "expired",
+            "rejected",
+            "done_for_day",
+            "calculated",
+            "suspended",
+            "replaced",
+        }
+
+        requested_qty = self._lifecycle_float(
+            self._broker_field(
+                order,
+                "qty",
+                position.get(
+                    "broker_open_quantity",
+                    0.0,
+                ),
+            ),
+            self._lifecycle_float(
+                position.get(
+                    "broker_open_quantity",
+                    0.0,
+                ),
+                0.0,
+            ) or 0.0,
+        ) or 0.0
+
+        position[
+            "broker_close_requested_qty"
+        ] = requested_qty
+        position[
+            "broker_close_unfilled_qty"
+        ] = max(
+            0.0,
+            requested_qty - filled_qty,
+        )
+
+        retryable_terminal = status in {
+            "canceled",
+            "expired",
+            "rejected",
+            "done_for_day",
+            "calculated",
+        }
+
+        if not (
+            status in terminal_statuses
+            and requested_qty - filled_qty > 1e-6
+            and retryable_terminal
+        ):
+            position[
+                "paper_exit_retry_eligible"
+            ] = False
+            position[
+                "paper_exit_retry_after_date"
+            ] = ""
+            position[
+                "paper_exit_retry_reason"
+            ] = ""
+
+        if (
+            status in terminal_statuses
+            and requested_qty - filled_qty > 1e-6
+            and retryable_terminal
+        ):
+            retry_after = (
+                now.date()
+                + timedelta(
+                    days=1
+                )
+            )
+            position[
+                "paper_exit_retry_policy"
+            ] = str(
+                self.parameters.get(
+                    "paper_exit_terminal_retry_policy",
+                    "NEXT_TRADING_DATE",
+                )
+            )
+            position[
+                "paper_exit_retry_after_date"
+            ] = retry_after.isoformat()
+            position[
+                "paper_exit_retry_eligible"
+            ] = False
+            position[
+                "paper_exit_retry_reason"
+            ] = status.upper()
+
+        if status in terminal_statuses and filled_qty <= 0:
+            self._transition_trade_lifecycle(
+                position,
+                "CLOSE_ALERTED",
+                "PAPER close order is terminal without a fill; "
+                "position remains open and same-day retry/chasing is disabled",
+                details={
+                    "broker_order_id": broker_order_id,
+                    "client_order_id": returned_client_order_id,
+                    "status": status,
+                    "retry_after_date": position.get(
+                        "paper_exit_retry_after_date",
+                        "",
+                    ),
+                },
+            )
+        else:
+            self._transition_trade_lifecycle(
+                position,
+                "CLOSE_WORKING",
+                "Alpaca PAPER close order is linked; awaiting broker "
+                "position reconciliation before declaring the trade closed",
+                details={
+                    "broker_order_id": broker_order_id,
+                    "client_order_id": returned_client_order_id,
+                    "status": status,
+                    "filled_qty": filled_qty,
+                    "requested_qty": requested_qty,
+                    "limit_price": float(limit_price),
+                    "order_style": order_style,
+                    "source": source,
+                    "retry_after_date": position.get(
+                        "paper_exit_retry_after_date",
+                        "",
+                    ),
+                },
+            )
+
+        self._tracked_alert_positions[
+            position[
+                "id"
+            ]
+        ] = position
+        self._save_trade_alert_positions_state()
+
+        return {
+            "submitted": source == "SUBMIT_ORDER",
+            "linked": True,
+            "order_id": broker_order_id,
+            "client_order_id": returned_client_order_id,
+            "status": status,
+            "limit_price": float(limit_price),
+            "order_style": order_style,
+            "source": source,
+            "filled_qty": filled_qty,
+        }
+
+
+    def _execute_paper_option_exit(
+        self,
+        row,
+        lifecycle_id,
+    ):
+        """Idempotently submit/link one Alpaca PAPER option close."""
+
+        if not self.paper_exit_execution_armed:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "DISABLED",
+                "reason": "PAPER exit execution is not armed",
+            }
+
+        if not self.alpaca_is_paper:
+            raise RuntimeError(
+                "Paper exit execution attempted with a non-paper Alpaca client"
+            )
+
+        position = self._tracked_alert_positions.get(
+            lifecycle_id
+        )
+
+        if position is None:
+            raise RuntimeError(
+                "Lifecycle record must exist before PAPER exit execution"
+            )
+
+        broker_open_qty = self._lifecycle_float(
+            position.get(
+                "broker_open_quantity",
+                0.0,
+            ),
+            0.0,
+        ) or 0.0
+
+        if broker_open_qty <= 0:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "NO_BROKER_POSITION",
+                "reason": "No broker-confirmed open quantity remains",
+            }
+
+        max_per_run = max(
+            0,
+            int(
+                self.parameters.get(
+                    "paper_exit_execution_max_orders_per_run",
+                    5,
+                )
+            ),
+        )
+
+        if (
+            max_per_run > 0
+            and self._paper_exit_orders_submitted_this_run
+            >= max_per_run
+        ):
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "RUN_CAP",
+                "reason": "PAPER exit execution per-run order cap reached",
+            }
+
+        decision = str(
+            row.get(
+                "decision",
+                "",
+            )
+            or ""
+        ).upper()
+
+        required_options_level = (
+            3
+            if decision in {
+                "BULL CALL SPREAD",
+                "BEAR PUT SPREAD",
+            }
+            else 2
+        )
+
+        try:
+            known_options_level = int(
+                self.options_trading_level
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            known_options_level = None
+
+        if known_options_level is None:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "OPTIONS_LEVEL_UNKNOWN",
+                "reason": "PAPER exit execution fails closed when options level is unknown",
+            }
+
+        if known_options_level < required_options_level:
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "OPTIONS_LEVEL_INSUFFICIENT",
+                "reason": (
+                    f"Structure requires Alpaca options level "
+                    f"{required_options_level}; account reports "
+                    f"level {known_options_level}"
+                ),
+            }
+
+        row_for_order = row.copy()
+        row_for_order[
+            "quantity"
+        ] = max(
+            1,
+            int(
+                round(
+                    broker_open_qty
+                )
+            ),
+        )
+
+        trade_date = self.get_datetime().date()
+
+        retry_after_text = str(
+            position.get(
+                "paper_exit_retry_after_date",
+                "",
+            )
+            or ""
+        )
+
+        if retry_after_text:
+            try:
+                retry_after_date = date.fromisoformat(
+                    retry_after_text
+                )
+            except ValueError:
+                retry_after_date = None
+
+            if (
+                retry_after_date is not None
+                and trade_date < retry_after_date
+            ):
+                return {
+                    "submitted": False,
+                    "linked": False,
+                    "status": "RETRY_DEFERRED",
+                    "reason": (
+                        "Prior PAPER close order left a terminal "
+                        "remainder; same-day retry/chasing is disabled"
+                    ),
+                    "retry_after_date": retry_after_text,
+                }
+
+        client_order_id = self._paper_exit_execution_client_order_id(
+            lifecycle_id,
+            trade_date,
+        )
+
+        (
+            order_request,
+            limit_price,
+            order_style,
+        ) = self._build_paper_option_exit_order_request(
+            row_for_order,
+            client_order_id,
+        )
+
+        # Restart idempotency: recover today's deterministic close order
+        # instead of creating a duplicate. A new calendar day gets a new
+        # id so a DAY order that expired can be retried for the remaining qty.
+        try:
+            existing_order = (
+                self.alpaca_trading_client
+                .get_order_by_client_id(
+                    client_order_id
+                )
+            )
+        except Exception as exc:
+            if self._paper_execution_order_not_found(
+                exc
+            ):
+                existing_order = None
+            else:
+                position[
+                    "paper_exit_execution_last_error"
+                ] = str(exc)
+                position[
+                    "paper_exit_execution_last_error_at"
+                ] = self.get_datetime().isoformat()
+                self._save_trade_alert_positions_state()
+                return {
+                    "submitted": False,
+                    "linked": False,
+                    "status": "LOOKUP_FAILED",
+                    "reason": (
+                        "Could not verify deterministic PAPER close client "
+                        "order ID; submission fails closed"
+                    ),
+                    "error": str(exc),
+                    "client_order_id": client_order_id,
+                }
+
+        if existing_order is not None:
+            return self._persist_paper_exit_order_link(
+                position,
+                existing_order,
+                client_order_id,
+                limit_price,
+                order_style,
+                "EXISTING_CLIENT_ORDER_ID",
+            )
+
+        try:
+            order = self.alpaca_trading_client.submit_order(
+                order_data=order_request
+            )
+        except Exception as exc:
+            position[
+                "paper_exit_execution_last_error"
+            ] = str(exc)
+            position[
+                "paper_exit_execution_last_error_at"
+            ] = self.get_datetime().isoformat()
+
+            self._record_lifecycle_event(
+                position,
+                "PAPER_EXIT_SUBMISSION_FAILED",
+                "Alpaca PAPER close submission failed",
+                details={
+                    "client_order_id": client_order_id,
+                    "limit_price": float(limit_price),
+                    "order_style": order_style,
+                    "error": str(exc),
+                },
+            )
+
+            self._tracked_alert_positions[
+                lifecycle_id
+            ] = position
+            self._save_trade_alert_positions_state()
+
+            return {
+                "submitted": False,
+                "linked": False,
+                "status": "SUBMIT_FAILED",
+                "reason": "Alpaca PAPER submit_order close failed",
+                "error": str(exc),
+                "client_order_id": client_order_id,
+                "limit_price": float(limit_price),
+                "order_style": order_style,
+            }
+
+        self._paper_exit_orders_submitted_this_run += 1
+
+        return self._persist_paper_exit_order_link(
+            position,
+            order,
+            client_order_id,
+            limit_price,
+            order_style,
+            "SUBMIT_ORDER",
+        )
+
+
+    def _log_paper_exit_execution_result(
+        self,
+        payload,
+        result,
+    ):
+        if not self.paper_exit_execution_armed:
+            return
+
+        status = str(
+            result.get(
+                "status",
+                "UNKNOWN",
+            )
+            or "UNKNOWN"
+        )
+
+        if result.get(
+            "linked",
+            False,
+        ):
+            self.log_message(
+                "\n\n"
+                "======= ALPACA PAPER EXIT ORDER =======\n"
+                f"{payload['direction']} | {payload['underlying']} | "
+                f"{payload['decision']}\n"
+                f"Lifecycle: {payload['lifecycle_id']}\n"
+                f"Broker order ID: {result.get('order_id', '')}\n"
+                f"Client order ID: {result.get('client_order_id', '')}\n"
+                f"Order style: {result.get('order_style', '')}\n"
+                f"Limit signed price/share: ${result.get('limit_price', 0.0):.2f}\n"
+                f"Broker status: {status.upper()}\n"
+                f"Link source: {result.get('source', '')}\n"
+                "ACCOUNT: ALPACA PAPER ONLY\n"
+                "======================================="
+            )
+        else:
+            self.log_message(
+                "PAPER exit order was NOT submitted/linked for "
+                f"{payload['underlying']}: {result.get('reason', status)}"
+                + (
+                    f". Error={result.get('error')}"
+                    if result.get('error')
+                    else ""
+                )
+            )
 
 
     # ======================================================
@@ -15483,6 +21407,9 @@ class StockSuggestionStrategy(Strategy):
         sized,
         account,
     ):
+
+        # Per scanner iteration, not per process lifetime.
+        self._paper_execution_orders_submitted_this_run = 0
 
         if not self.trade_alerts_enabled:
 
@@ -15997,8 +21924,12 @@ class StockSuggestionStrategy(Strategy):
                 + f"Broker option gross: "
                 f"${payload['broker_option_gross_market_value']:,.2f} "
                 f"({payload['broker_option_gross_pct_equity'] * 100:.2f}% equity)\n"
-                "MODE: ALERT ONLY - NO ORDER SUBMITTED\n"
-                "================================="
+                + (
+                    "MODE: ALPACA PAPER ENTRY EXECUTION ARMED\n"
+                    if self.paper_execution_armed
+                    else "MODE: ALERT ONLY - NO ORDER SUBMITTED\n"
+                )
+                + "================================="
             )
 
             self.log_message(
@@ -16025,6 +21956,45 @@ class StockSuggestionStrategy(Strategy):
                 "ALERT_ESTIMATE",
             )
 
+            if self.paper_execution_armed:
+                execution_result = (
+                    self._execute_paper_option_entry(
+                        row,
+                        lifecycle_id,
+                    )
+                )
+
+                payload[
+                    "paper_execution"
+                ] = execution_result
+
+                lifecycle_record = (
+                    self._tracked_alert_positions.get(
+                        lifecycle_id,
+                        {},
+                    )
+                )
+
+                payload[
+                    "lifecycle_status"
+                ] = str(
+                    lifecycle_record.get(
+                        "status",
+                        payload[
+                            "lifecycle_status"
+                        ],
+                    )
+                )
+
+                self._log_paper_execution_result(
+                    payload,
+                    execution_result,
+                )
+
+            self._append_trade_alert_jsonl(
+                payload
+            )
+
             alerts.append(
                 payload
             )
@@ -16049,7 +22019,11 @@ class StockSuggestionStrategy(Strategy):
 
         self.log_message(
             "Sizing positions and generating "
-            "read-only trade alerts..."
+            + (
+                "PAPER-executable trade alerts..."
+                if self.paper_execution_armed
+                else "read-only trade alerts..."
+            )
         )
 
         (
@@ -16142,170 +22116,387 @@ class StockSuggestionStrategy(Strategy):
             bearish_options,
         )
     # ======================================================
+    # RUNTIME SCAN / MANAGEMENT CADENCE
+    # ======================================================
+
+    def _intraday_management_lifecycles(self):
+        """Return option lifecycles needing broker/order/exit monitoring."""
+
+        managed_statuses = {
+            "ENTRY_WORKING",
+            "PARTIALLY_OPEN",
+            "OPEN",
+            "CLOSE_ALERTED",
+            "CLOSE_WORKING",
+            "PARTIALLY_CLOSED",
+            "ORPHANED",
+        }
+
+        rows = []
+
+        for lifecycle_id, position in (
+            self._tracked_alert_positions.items()
+        ):
+            if (
+                str(position.get("asset_type", "OPTION") or "OPTION").upper()
+                != "OPTION"
+            ):
+                continue
+
+            status = self._normalize_lifecycle_status(
+                position.get("status", "ALERTED")
+            )
+
+            # An explicitly linked broker entry should never be allowed to
+            # disappear into the old ALERTED cadence even if a stale state
+            # file has not yet promoted its lifecycle status.
+            linked_alert = (
+                status == "ALERTED"
+                and bool(position.get("broker_entry_order_id"))
+            )
+
+            if status in managed_statuses or linked_alert:
+                rows.append((lifecycle_id, position))
+
+        return rows
+
+    def _set_in_session_runtime_cadence(self):
+        """Report logical work mode; framework wake cadence stays fixed at 1M."""
+
+        managed = self._intraday_management_lifecycles()
+        needs_management = bool(managed)
+
+        if needs_management:
+            label = "INTRADAY_MANAGEMENT"
+            work_text = (
+                f"broker/order/exit management active for {len(managed)} "
+                "option lifecycle(s); every 1M framework wake is eligible "
+                "for lightweight management. Full scanning remains once per date."
+            )
+        else:
+            label = "DAILY_SCANNER"
+            work_text = (
+                "no broker-managed option lifecycle is active; framework still "
+                "wakes every 1M, but expensive full scanning remains once per date."
+            )
+
+        # Do NOT mutate self.sleeptime here. LumiBot 4.5.x can schedule the
+        # next wake using the value captured at iteration start, making dynamic
+        # changes lag or sleep until the following day. The framework driver is
+        # permanently options_management_sleeptime (1M by default).
+        if getattr(self, "_runtime_cadence_label", None) != label:
+            self._runtime_cadence_label = label
+            self.log_message(
+                "RUNTIME WORK MODE: " + work_text
+            )
+
+        return needs_management
+
+    @staticmethod
+    def _sleeptime_seconds(value):
+        """Parse LumiBot-style S/M/H/D duration strings for internal throttles."""
+
+        text = str(value or "").strip().upper()
+        if not text:
+            return 60.0
+
+        units = {"S": 1.0, "M": 60.0, "H": 3600.0, "D": 86400.0}
+        suffix = text[-1]
+        if suffix in units:
+            number = text[:-1].strip()
+            try:
+                return max(1.0, float(number) * units[suffix])
+            except Exception:
+                return 60.0
+
+        try:
+            # Match LumiBot's integer/numeric convention: bare values are minutes.
+            return max(1.0, float(text) * 60.0)
+        except Exception:
+            return 60.0
+
+    def _regular_market_is_open_from_session_status(self, session_status):
+        """True during regular hours, including our opening/closing buffers."""
+
+        if bool(session_status.get("allowed")):
+            return True
+
+        reason = str(session_status.get("reason", "") or "").lower()
+        return reason.startswith("inside regular session")
+
+    def _closed_market_reconciliation_due(self, session_status):
+        """Throttle after-hours broker reconciliation while the 1M driver stays alive."""
+
+        now = session_status.get("now")
+        if not isinstance(now, datetime):
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        now_utc = now.astimezone(timezone.utc)
+        interval_seconds = self._sleeptime_seconds(
+            self.parameters["options_closed_retry_sleeptime"]
+        )
+
+        last = getattr(self, "_last_closed_market_reconcile_at", None)
+        if isinstance(last, datetime):
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            elapsed = (now_utc - last.astimezone(timezone.utc)).total_seconds()
+            if elapsed < interval_seconds:
+                return False
+
+        self._last_closed_market_reconcile_at = now_utc
+        return True
+
+    def _full_scan_due_for_market_date(self, market_date):
+        return getattr(
+            self,
+            "_last_full_scan_market_date",
+            None,
+        ) != market_date
+
+    def _management_only_stock_results(self):
+        """Build only the stock thesis metrics needed by open positions."""
+
+        underlyings = sorted({
+            str(position.get("underlying", "") or "")
+            for _, position in self._intraday_management_lifecycles()
+            if (
+                self._normalize_lifecycle_status(
+                    position.get("status", "ALERTED")
+                )
+                in self._lifecycle_exit_managed_statuses()
+                and str(position.get("underlying", "") or "")
+            )
+        })
+
+        if not underlyings:
+            return pd.DataFrame()
+
+        try:
+            histories = self.get_historical_prices_for_assets(
+                underlyings,
+                65,
+                timestep="day",
+                chunk_size=100,
+                max_workers=min(5, max(1, len(underlyings))),
+            )
+        except Exception as exc:
+            self.log_message(
+                "Management-only stock thesis lookup failed; "
+                f"P/L/DTE management will continue with thesis UNKNOWN. "
+                f"Reason={exc}"
+            )
+            return pd.DataFrame()
+
+        rows = []
+        today = self.get_datetime().date()
+
+        for asset, bars in histories.items():
+            if bars is None:
+                continue
+
+            df = bars.pandas_df.copy()
+            if len(df) > 0 and df.index[-1].date() == today:
+                df = df.iloc[:-1]
+
+            if len(df) < 21:
+                continue
+
+            close = df["close"].astype(float)
+            price = float(close.iloc[-1])
+            sma20 = float(close.tail(20).mean())
+            momentum20 = float(price / close.iloc[-21] - 1)
+            symbol = asset.symbol if hasattr(asset, "symbol") else str(asset)
+
+            rows.append({
+                "symbol": symbol,
+                "price": price,
+                "sma20": sma20,
+                "momentum20": momentum20,
+            })
+
+        result = pd.DataFrame(rows)
+        self.log_message(
+            "MANAGEMENT-ONLY THESIS DATA: "
+            f"{len(result)} of {len(underlyings)} broker-managed "
+            "underlying(s) have current completed-daily metrics."
+        )
+        return result
+
+    # ======================================================
     # MAIN SCANNER
     # ======================================================
 
     def on_trading_iteration(self):
 
         # --------------------------------------------------
-        # OPTIONS MARKET-SESSION GATE
+        # FIXED 1M FRAMEWORK DRIVER + INTERNAL WORK THROTTLING
         # --------------------------------------------------
         #
-        # The LumiBot strategy can remain on MARKET=24/7,
-        # but no stock/options entry or exit decisions are
-        # evaluated outside the actionable options window.
+        # LumiBot's scheduler may use the sleeptime value captured at the start
+        # of an iteration when deciding the next wake. Therefore self.sleeptime
+        # remains fixed at 1M for the lifetime of this process. Full scans,
+        # management work, and closed-market reconciliation are throttled here.
         # --------------------------------------------------
 
-        session_status = (
-            self._get_options_session_status()
+        session_status = self._get_options_session_status()
+        regular_market_open = self._regular_market_is_open_from_session_status(
+            session_status
         )
 
-        if not session_status[
-            "allowed"
-        ]:
-
-            self.sleeptime = (
-                self.parameters[
-                    "options_closed_retry_sleeptime"
-                ]
+        if regular_market_open:
+            self._closed_gate_skip_logged = False
+            reconcile_now = True
+        else:
+            reconcile_now = self._closed_market_reconciliation_due(
+                session_status
             )
 
-            market_now = (
-                session_status.get(
-                    "now"
+        if reconcile_now:
+            try:
+                (
+                    lifecycle_results,
+                    lifecycle_snapshot,
+                ) = self.reconcile_trade_lifecycle_states()
+
+                self.log_trade_lifecycle_reconciliation(
+                    lifecycle_results,
+                    lifecycle_snapshot,
                 )
-            )
 
+                self.log_broker_fill_accounting()
+                analytics = self.refresh_trade_journal_analytics()
+                self.refresh_trading_circuit_breakers(
+                    market_now=session_status.get("now")
+                )
+                self._scan_and_record_trading_anomalies(
+                    lifecycle_snapshot=lifecycle_snapshot
+                )
+                self.refresh_daily_operational_summary(
+                    session_status=session_status,
+                    lifecycle_snapshot=lifecycle_snapshot,
+                    analytics=analytics,
+                )
+
+            except Exception as exc:
+                self._record_trading_anomaly(
+                    "LIFECYCLE_RECONCILIATION_FAILURE",
+                    "ERROR",
+                    f"Trade lifecycle reconciliation failed: {exc}",
+                )
+                self.log_message(
+                    "Trade lifecycle reconciliation failed; "
+                    "prior persistent states are retained. "
+                    f"Reason={exc}"
+                )
+        else:
+            # Avoid hammering Alpaca all night. The framework still wakes every
+            # minute so it cannot get stranded on a once-per-day scheduler.
+            if getattr(self, "_runtime_cadence_label", None) != "CLOSED_THROTTLED":
+                self._runtime_cadence_label = "CLOSED_THROTTLED"
+                self.log_message(
+                    "CLOSED-MARKET THROTTLE: framework wake cadence="
+                    f"{self.sleeptime}; broker reconciliation interval="
+                    f"{self.parameters['options_closed_retry_sleeptime']}."
+                )
+
+        # --------------------------------------------------
+        # OPTIONS MARKET-SESSION GATE
+        # --------------------------------------------------
+        # New entry scans and P/L exit signals remain regular-session only.
+        # Broker/order reconciliation above can still run after hours on the
+        # internal throttled interval.
+        # --------------------------------------------------
+
+        if not session_status["allowed"]:
+            market_now = session_status.get("now")
             now_text = (
                 "unknown"
                 if market_now is None
-                else market_now.strftime(
-                    "%Y-%m-%d %I:%M:%S %p ET"
-                )
+                else market_now.strftime("%Y-%m-%d %I:%M:%S %p ET")
             )
 
-            actionable_open = (
-                session_status.get(
-                    "actionable_open"
-                )
-            )
+            actionable_open = session_status.get("actionable_open")
+            actionable_close = session_status.get("actionable_close")
 
-            actionable_close = (
-                session_status.get(
-                    "actionable_close"
-                )
-            )
-
-            if (
-                actionable_open is not None
-                and actionable_close is not None
-            ):
-
+            if actionable_open is not None and actionable_close is not None:
                 window_text = (
-                    actionable_open.strftime(
-                        "%I:%M %p ET"
-                    )
+                    actionable_open.strftime("%I:%M %p ET")
                     + " - "
-                    + actionable_close.strftime(
-                        "%I:%M %p ET"
-                    )
+                    + actionable_close.strftime("%I:%M %p ET")
                 )
-
             else:
-
                 window_text = "not currently available"
 
-            self.log_message(
-                "MARKET SESSION GATE: CLOSED. "
-                f"Market time={now_text}. "
-                f"Reason={session_status['reason']}. "
-                f"Actionable window={window_text}. "
-                "Skipping stock/options entries and "
-                "exit-management P/L signals. "
-                "Retry cadence="
-                f"{self.sleeptime}."
-            )
-
+            if reconcile_now or not self._closed_gate_skip_logged:
+                self.log_message(
+                    "MARKET SESSION GATE: CLOSED. "
+                    f"Market time={now_text}. "
+                    f"Reason={session_status['reason']}. "
+                    f"Actionable window={window_text}. "
+                    + (
+                        "Broker/order lifecycle reconciliation completed; "
+                        if reconcile_now
+                        else "Broker reconciliation skipped on this throttled wake; "
+                    )
+                    + "stock/options entries and exit-management P/L signals are skipped. "
+                    + f"Framework wake cadence={self.sleeptime}; "
+                    + f"closed-market reconciliation interval="
+                    + f"{self.parameters['options_closed_retry_sleeptime']}."
+                )
+                self._closed_gate_skip_logged = True
             return
 
-        self.sleeptime = (
-            self.parameters[
-                "options_active_sleeptime"
-            ]
-        )
+        market_now = session_status["now"]
+        actionable_open = session_status["actionable_open"]
+        actionable_close = session_status["actionable_close"]
 
-        market_now = (
-            session_status[
-                "now"
-            ]
-        )
-
-        actionable_open = (
-            session_status[
-                "actionable_open"
-            ]
-        )
-
-        actionable_close = (
-            session_status[
-                "actionable_close"
-            ]
-        )
-
-        if (
-            actionable_open is not None
-            and actionable_close is not None
-        ):
-
+        if actionable_open is not None and actionable_close is not None:
             actionable_window_text = (
-                actionable_open.strftime(
-                    "%I:%M %p ET"
-                )
+                actionable_open.strftime("%I:%M %p ET")
                 + " - "
-                + actionable_close.strftime(
-                    "%I:%M %p ET"
-                )
+                + actionable_close.strftime("%I:%M %p ET")
             )
-
         else:
-
-            actionable_window_text = (
-                "gate disabled"
-            )
+            actionable_window_text = "gate disabled"
 
         self.log_message(
             "MARKET SESSION GATE: OPEN. "
-            f"Market time="
-            f"{market_now.strftime('%I:%M:%S %p ET')}. "
-            f"Actionable window="
-            f"{actionable_window_text}. "
-            f"Max option quote age="
-            f"{self.parameters['option_quote_max_age_seconds']}s."
+            f"Market time={market_now.strftime('%I:%M:%S %p ET')}. "
+            f"Actionable window={actionable_window_text}. "
+            f"Max option quote age={self.parameters['option_quote_max_age_seconds']}s."
         )
 
-        # --------------------------------------------------
-        # RECONCILE PERSISTENT TRADE LIFECYCLES
-        # --------------------------------------------------
+        needs_intraday_management = self._set_in_session_runtime_cadence()
+        market_date = market_now.date()
+        full_scan_due = self._full_scan_due_for_market_date(
+            market_date
+        )
 
-        try:
+        if not full_scan_due:
+            if needs_intraday_management:
+                self.log_message(
+                    "MANAGEMENT-ONLY ITERATION: full stock/options scan already "
+                    "completed for this market date; reconciling exposure and "
+                    "evaluating exits without rebuilding the full universe."
+                )
+                stock_results = self._management_only_stock_results()
+                self.run_exit_management(stock_results)
+                self._set_in_session_runtime_cadence()
+            else:
+                self.log_message(
+                    "Full stock/options scan already completed for this market date "
+                    "and no broker-managed option lifecycle requires intraday work."
+                )
+            return
 
-            (
-                lifecycle_results,
-                lifecycle_snapshot,
-            ) = self.reconcile_trade_lifecycle_states()
-
-            self.log_trade_lifecycle_reconciliation(
-                lifecycle_results,
-                lifecycle_snapshot,
-            )
-
-        except Exception as exc:
-
-            self.log_message(
-                "Trade lifecycle reconciliation failed; "
-                "prior persistent states are retained. "
-                f"Reason={exc}"
-            )
+        # Mark the expensive scanner as consumed for this market date before
+        # starting it, so an unrelated downstream exception cannot turn a 1M
+        # management cadence into repeated full-universe API scans. A process
+        # restart intentionally permits one fresh full scan.
+        self._last_full_scan_market_date = market_date
 
         # --------------------------------------------------
         # BUILD THE UNIVERSE AUTOMATICALLY
@@ -16854,6 +23045,8 @@ class StockSuggestionStrategy(Strategy):
                         results
                     )
 
+                self._set_in_session_runtime_cadence()
+
             except Exception as exc:
 
                 self.log_message(
@@ -16903,6 +23096,11 @@ class StockSuggestionStrategy(Strategy):
             self.run_exit_management(
                 results
             )
+
+            # New submissions or newly opened/closing positions must switch
+            # the next wakeup from the daily scanner cadence to lightweight
+            # intraday management immediately.
+            self._set_in_session_runtime_cadence()
 
         except Exception as exc:
 
