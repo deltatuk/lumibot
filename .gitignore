@@ -13,7 +13,20 @@ __pycache__/
 .option_iv_history.json
 .trade_alert_dedupe.json
 .trade_alert_positions.json
+.trade_alert_positions.json.backups/
+.trading_circuit_breakers.json
 trade_alerts.jsonl
+exit_alerts.jsonl
+trading_anomalies.jsonl
+
+# Generated trading reports and analytics
+daily_trading_summary.json
+startup_health.json
+trade_analytics.json
+trade_journal.csv
 
 # Generated backtest reports and logs
 logs/
+walk_forward_bars.csv
+walk_forward_config.json
+walk_forward_universe.csv
